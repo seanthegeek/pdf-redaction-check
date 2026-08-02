@@ -76,5 +76,6 @@ include = [
     "make-test-samples.py",
     "tests/",
     "README.md",
+    "docs/",
     "LICENSE",
 ]

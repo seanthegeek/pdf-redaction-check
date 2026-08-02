@@ -161,89 +161,8 @@ audit a redaction someone else performed.
 
 ## Development
 
-`./build.sh` creates `.venv` if it does not already exist, installs the runtime
-and development dependencies into it, and builds the sdist and wheel into
-`dist/`. In VSCode it is the default build task, so `Ctrl+Shift+B`
-(`Cmd+Shift+B` on macOS) runs it, or pick it from *Terminal → Run Build Task*.
-
-```bash
-./build.sh
-source .venv/bin/activate
-
-pytest
-pytest --cov          # enforces the coverage gate CI applies
-ruff check pdf-redaction-check.py make-test-samples.py tests/
-ruff format --check pdf-redaction-check.py make-test-samples.py tests/
-pyright               # needs the venv active; paths come from pyproject
-npx markdownlint-cli2
-./pdf-redaction-check.py tests/samples/tagged.pdf --dump-hidden
-```
-
-### Continuous integration
-
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push and
-pull request:
-
-| Job | What it does |
-| --- | ------------ |
-| Tests | The suite on Python 3.11 through 3.14 |
-| Coverage gate | `pytest --cov`, failing below `fail_under` in pyproject |
-| Lint | `ruff check`, `ruff format --check`, `pyright`, markdownlint |
-| Build | sdist and wheel, `twine check`, then installs and runs the command |
-
-The commands are the ones above, so a green local run means a green CI run.
-Coverage is measured with branches enabled and currently sits at 100% for both
-`pdf-redaction-check.py` and `make-test-samples.py`; the gate is enforced on a single
-Python version, because which lines are reachable can differ between
-interpreters.
-
-The build job installs the wheel and runs the console script against a sample
-on purpose: the hyphenated filename is renamed on the way into the wheel, and
-if that mapping breaks the package still installs while the command does not
-run.
-
-### Releasing
-
-[`.github/workflows/release.yml`](.github/workflows/release.yml) publishes to
-PyPI when a GitHub release is published. To cut one:
-
-1. Bump `version` in `pyproject.toml` and commit it.
-2. Tag with a `v` prefix and publish a GitHub release for that tag.
-
-The workflow builds, refuses to continue if the tag disagrees with the packaged
-version, installs the wheel and runs the command, publishes, and finally
-attaches the sdist and wheel to the release. Running it manually from the
-Actions tab publishes to TestPyPI instead, as a dry run.
-
-There is no PyPI API token in this repository. Publishing uses [Trusted
-Publishing][tp]: GitHub mints a short-lived credential for each run, scoped to
-this repository, this workflow file, and the `pypi` environment. Renaming the
-workflow file or the environment breaks releases until the publisher
-configuration on PyPI is updated to match.
-
-Run the script from the working tree during development. Do not use
-`pip install -e .`: the script filename is hyphenated, which is not a legal
-Python module name, so the build renames it on the way into the wheel — and that
-rename makes an editable install a stale copy rather than a live link.
-
-### Test samples
-
-The sample PDFs in [tests/samples/](tests/samples/) are committed, one per
-failure mode. The tests read them directly, so a test run is deterministic and
-does not need reportlab — a freshly generated PDF carries a new `CreationDate`
-every time, which would make results drift.
-
-`make-test-samples.py` rebuilds them. Run it by hand after changing or adding a
-fixture, and commit the result:
-
-```bash
-python make-test-samples.py   # rewrites tests/samples/
-```
-
-Keeping the generator next to the binaries is deliberate: a committed PDF in a
-security tool should never be a blob nobody can reproduce or audit. Every
-sample uses a fictional address, so they are safe to commit and safe to attach
-to a bug report.
+[docs/development.md](docs/development.md) covers building and testing, what CI
+enforces, how a release is cut, and how the test samples are regenerated.
 
 ## AI assistance disclaimer
 
@@ -263,4 +182,3 @@ MIT. See [LICENSE](LICENSE).
 
 [asd]: https://www.cyber.gov.au/sites/default/files/2023-03/PROTECT%20-%20An%20Examination%20of%20the%20Redaction%20Functionality%20of%20Adobe%20Acrobat%20Pro%20DC%202017%20(October%202021).pdf
 [pikepdf]: https://github.com/pikepdf/pikepdf
-[tp]: https://docs.pypi.org/trusted-publishers/

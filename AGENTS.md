@@ -31,8 +31,11 @@ may imply otherwise.
 - `build.sh` — creates `.venv` if absent, then builds the sdist and wheel into
   the gitignored `dist/`
 - `.github/workflows/ci.yml` — tests, coverage gate, lint, and build
+- `.github/workflows/release.yml` — publishes to PyPI when a GitHub release is
+  published; manual runs go to TestPyPI
 - `.vscode/tasks.json` — makes `build.sh` the default VSCode build task
 - `README.md` — user-facing overview, usage, and limitations
+- `docs/development.md` — building, testing, CI, releasing, and test samples
 
 **Script filenames in this repo are hyphenated, by preference.** A hyphen is not
 legal in a Python module name, so `pyproject.toml` renames the file on the way
@@ -427,11 +430,11 @@ artifacts to the release. Three things follow from that.
 The project must be well documented. If existing documentation exists, follow
 that convention.
 
-This project currently documents itself in a single `README.md`, which covers
-the rationale, usage, exit codes, checked layers, limitations, and an AI
-assistance disclaimer. Follow that. If the README outgrows one page, split the
-detail into bite-sized pages under a `docs/` directory and leave the README as
-the overview — do not let it become a monolith.
+`README.md` is the overview: the rationale, usage, exit codes, checked layers,
+limitations, and an AI assistance disclaimer. Detail that only a contributor
+needs lives in bite-sized pages under `docs/`, linked from the README — today
+that is `docs/development.md`. Keep the split: the README describes what the
+tool does, `docs/` describes working on it, and neither becomes a monolith.
 
 The "Limitations" and "AI assistance disclaimer" sections are load-bearing for a
 security tool. Keep them accurate and do not soften them.
