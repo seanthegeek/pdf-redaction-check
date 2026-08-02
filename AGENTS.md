@@ -23,10 +23,15 @@ may imply otherwise.
 ### Layout
 
 - `pdf-redaction-check.py` — the entire tool: checks, report model, and CLI
-- `make-tests.py` — generates synthetic fixture PDFs, one per failure mode
-- `pyproject.toml` — hatchling build; installs the `pdf-redaction-check` command
+- `tests/samples/` — the committed sample PDFs, one per failure mode
+- `make-test-samples.py` — rebuilds `tests/samples/`; run by hand, never by the
+  tests
+- `pyproject.toml` — hatchling build, pytest and coverage config; installs the
+  `pdf-redaction-check` command
 - `build.sh` — creates `.venv` if absent, then builds the sdist and wheel into
   the gitignored `dist/`
+- `.github/workflows/ci.yml` — tests, coverage gate, lint, and build
+- `.vscode/tasks.json` — makes `build.sh` the default VSCode build task
 - `README.md` — user-facing overview, usage, and limitations
 
 **Script filenames in this repo are hyphenated, by preference.** A hyphen is not
@@ -55,11 +60,17 @@ Three consequences worth knowing before you touch packaging:
 ### Common commands
 
 ```bash
-./build.sh                    # venv if needed, deps, sdist + wheel into dist/
+./build.sh                          # venv if needed, deps, sdist + wheel
+source .venv/bin/activate           # pyright resolves imports from the
+                                    # active interpreter
 ./pdf-redaction-check.py FILE.pdf   # run from the working tree
-ruff check pdf-redaction-check.py
-ruff format --check pdf-redaction-check.py
-python make-tests.py          # regenerate fixture PDFs (gitignored)
+pytest
+pytest --cov                        # same coverage gate CI applies
+ruff check pdf-redaction-check.py make-test-samples.py tests/
+ruff format --check pdf-redaction-check.py make-test-samples.py tests/
+pyright                             # paths come from [tool.pyright]
+npx markdownlint-cli2
+python make-test-samples.py         # rebuild tests/samples/, then commit it
 ```
 
 ## Conventions
@@ -158,7 +169,7 @@ someone's address is still in a document.
   call `Pdf.save()`, do not pass `allow_overwriting_input=True`, and do not add
   a "fix it for me" mode without an explicit decision from the author. The tool
   is evidence-gathering; a file it has touched is no longer the file the user
-  wanted checked. `make_tests.py` is the only place that writes PDFs.
+  wanted checked. `make-test-samples.py` is the only place that writes PDFs.
 - **A malformed PDF is input, not a crash.** Hostile and broken files are the
   normal case here. Every parser path must degrade to "could not read this
   layer" rather than raising — but degrade narrowly, per the `except Exception`
@@ -186,14 +197,21 @@ someone's address is still in a document.
 
 ## Testing
 
-- **Fixtures use fictional data only.** `make-tests.py` uses a fictional address
-  (742 Evergreen Terrace) so fixtures are safe to commit and safe to paste into
-  a bug report. Never add a fixture built from a real document, a real person's
+- **Fixtures use fictional data only.** The samples use a fictional address (742
+  Evergreen Terrace) so they are safe to commit and safe to paste into a bug
+  report. Never add a fixture built from a real document, a real person's
   details, or a redacted file someone sent you.
+- **The sample PDFs in `tests/samples/` are committed, and `make-test-samples.py`
+  rebuilds them.** Tests read the committed files, so runs are deterministic and
+  do not need reportlab. Changing a fixture means running `python make-test-samples.py`
+  and committing both the generator change and the regenerated PDF — never one
+  without the other, or the binary stops matching the code that claims to
+  produce it.
 - **Every check needs a fixture that fails without it.** A new detection layer
-  ships with a generator in `make-tests.py` that produces a PDF exhibiting that
-  exact failure mode, plus confirmation that the clean fixture still passes. A
-  check with no fixture is an assertion about PDFs that nobody has tested.
+  ships with a builder in `make-test-samples.py`, the regenerated sample, and a
+  test asserting the check fires on it — plus confirmation that `clean.pdf` still
+  reports nothing. A check with no sample is an assertion about PDFs that nobody
+  has tested.
 - **A test named for an exclusive claim must prove both halves.** "Only",
   "never", and "exactly once" each assert a negative as well as a positive. If
   the shared test setup can't observe the negative half, build a fresh setup for
@@ -310,10 +328,23 @@ are relations between two individually-correct places.
 
 ### Verify what CI enforces, not a plausible subset
 
-- **Run CI's literal commands from the repo root** — read the workflow file.
-  When repo-wide runs are noisy because of untracked local directories, fix the
-  exclusion in config rather than narrowing the command — a narrowed command is
-  a different check that happens to share a name.
+- **Run CI's literal commands from the repo root** — read
+  `.github/workflows/ci.yml`. Its four jobs are tests across Python 3.11–3.14, a
+  coverage gate, lint (ruff, pyright, markdownlint), and a build that installs
+  the wheel and runs the console script. Run `pyright` with the virtualenv
+  activated: it resolves imports from the active interpreter, and an
+  unactivated run reports every third-party import as missing — noise that
+  looks like a real failure. When repo-wide runs are noisy because of untracked
+  local directories,
+  fix the exclusion in config rather than narrowing the command — a narrowed
+  command is a different check that happens to share a name. The markdownlint
+  globs live in `.markdownlint-cli2.jsonc` for exactly this reason: the naive
+  `**/*.md` walks `.venv` and fails on vendored files the repo does not own.
+- **Coverage is a gate, not a report.** `pytest --cov` fails below the
+  `fail_under` value in `pyproject.toml`, with branch coverage enabled — an `if`
+  whose false path never runs is untested even when every line has executed. New
+  code lands with the tests that cover both directions of its branches, or the
+  threshold comes down deliberately and in the same commit.
 - **Cover CI's gates, not just its commands.** Patch coverage corresponds to no
   replayable workflow command, so command-replay never asks "does a test execute
   every new line?" — compare coverage's missing-lines report against the diff

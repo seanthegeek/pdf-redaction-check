@@ -4,13 +4,13 @@ __pycache__/
 .venv/
 venv/
 .ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
 
 # Build output
 build/
 dist/
 
-# Generated test fixtures
-clean.pdf
-fake_redacted.pdf
-orphan_font.pdf
-unapplied.pdf
+# The sample PDFs in tests/samples are committed on purpose -- they are
+# the test corpus. Rebuild them with `python make-tests.py`.

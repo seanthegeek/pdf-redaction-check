@@ -1,0 +1,14 @@
+{
+  // Mirrors the markdownlint settings in .vscode/settings.json so the
+  // editor and CI agree. MD024 allows the repeated headings a Keep a
+  // Changelog file needs.
+  "config": {
+    "MD024": false
+  },
+  "globs": [
+    "**/*.md"
+  ],
+  // Without this, the glob walks .venv and lints vendored third-party
+  // markdown, failing the build on files this repo does not own.
+  "gitignore": true
+}

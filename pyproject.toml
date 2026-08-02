@@ -26,7 +26,7 @@ classifiers = [
 dependencies = ["pikepdf>=8"]
 
 [project.optional-dependencies]
-dev = ["reportlab", "ruff"]
+dev = ["pyright", "pytest", "pytest-cov", "reportlab", "ruff"]
 
 [project.urls]
 Source = "https://github.com/seanthegeek/pdf-redaction-check"
@@ -41,10 +41,40 @@ pdf-redaction-check = "pdf_redaction_check:run"
 only-include = []
 force-include = { "pdf-redaction-check.py" = "pdf_redaction_check.py" }
 
+[tool.pyright]
+include = ["pdf-redaction-check.py", "make-test-samples.py", "tests"]
+# Check against the oldest interpreter the project supports, not whatever
+# happens to be installed.
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
+# reportlab ships no type information. Its absence is a fact about that
+# package, not a defect in this code.
+reportMissingModuleSource = "none"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["."]
+# Branch coverage, not just statements: an `if` whose false path is
+# never taken is untested even when every line has run.
+branch = true
+# The tests themselves are not the thing under measurement.
+omit = ["tests/*"]
+
+[tool.coverage.report]
+exclude_also = [
+    # Entry-point guard: exercised by the console script, not by tests.
+    'if __name__ == "__main__":',
+]
+fail_under = 100
+show_missing = true
+
 [tool.hatch.build.targets.sdist]
 include = [
     "pdf-redaction-check.py",
-    "make-tests.py",
+    "make-test-samples.py",
+    "tests/",
     "README.md",
     "LICENSE",
 ]
