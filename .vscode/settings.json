@@ -1,0 +1,18 @@
+{
+    "markdownlint.config": {
+        "MD024": false
+    },
+    "cSpell.words": [
+        "bfchar",
+        "bfrange",
+        "CMap",
+        "CMaps",
+        "DocInfo",
+        "hatchling",
+        "pdftotext",
+        "pikepdf",
+        "reportlab",
+        "srcbuilds",
+        "tounicode"
+    ]
+}

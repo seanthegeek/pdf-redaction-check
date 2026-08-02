@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pdf-redaction-check"
+version = "0.1.0"
+description = "Verify that a PDF redaction actually removed the content, instead of just covering it up."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Sean Whalen" }]
+keywords = ["pdf", "redaction", "security", "forensics", "privacy"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: Legal Industry",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Security",
+    "Topic :: Text Processing :: Filters",
+]
+dependencies = ["pikepdf>=8"]
+
+[project.optional-dependencies]
+dev = ["reportlab", "ruff"]
+
+[project.urls]
+Source = "https://github.com/seanthegeek/pdf-redaction-check"
+Issues = "https://github.com/seanthegeek/pdf-redaction-check/issues"
+
+[project.scripts]
+pdf-redaction-check = "pdf_redaction_check:run"
+
+# The source file is hyphenated, which is not a legal Python module name, so it
+# is installed under an underscored name that the console script can import.
+[tool.hatch.build.targets.wheel]
+only-include = []
+force-include = { "pdf-redaction-check.py" = "pdf_redaction_check.py" }
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "pdf-redaction-check.py",
+    "make-tests.py",
+    "README.md",
+    "LICENSE",
+]

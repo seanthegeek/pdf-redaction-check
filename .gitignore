@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ruff_cache/
+
+# Build output
+build/
+dist/
+
+# Generated test fixtures
+clean.pdf
+fake_redacted.pdf
+orphan_font.pdf
+unapplied.pdf
