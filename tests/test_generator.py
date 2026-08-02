@@ -66,6 +66,35 @@ def test_generator_creates_its_output_directory(
     assert target.is_dir()
 
 
+def test_page_text_matches_what_the_page_actually_draws(
+    prc: ModuleType, maketests: ModuleType, fixtures: Path
+) -> None:
+    """The stale CMap is built from page_text, so it has to be right.
+
+    If page_text and letter_pdf ever disagree, the orphaned-font sample
+    would encode a CMap for text the page never contained, and the check
+    it exists to exercise would be testing fiction.
+    """
+    _, extracts = prc.analyze(fixtures / "clean.pdf", [], want_extracts=True)
+    drawn = next(e.text for e in extracts if e.layer == prc.CONTENT_STREAM)
+    expected = maketests.page_text(
+        maketests.CAPTIONS["clean.pdf"], include_secret=False
+    )
+    assert drawn == expected
+    assert maketests.SECRET not in expected
+
+
+def test_page_text_adds_the_secret_when_asked(maketests: ModuleType) -> None:
+    caption = maketests.CAPTIONS["orphan_font.pdf"]
+    assert maketests.SECRET in maketests.page_text(caption, include_secret=True)
+
+
+def test_every_caption_names_its_own_file(maketests: ModuleType) -> None:
+    for name, caption in maketests.CAPTIONS.items():
+        assert name in caption, f"{name} caption does not name the file"
+        assert maketests.SECRET not in caption
+
+
 def test_every_sample_uses_only_the_fictional_address(
     prc: ModuleType, fixtures: Path
 ) -> None:

@@ -169,9 +169,20 @@ class TestFixtures:
         report, _ = prc.analyze(fixtures / "orphan_font.pdf", [])
         findings = [f for f in report.findings if f.check == prc.FONT_CHARSET]
         assert len(findings) == 1
-        # First-appearance order of the characters unique to the secret.
-        assert "'742EvgT'" in findings[0].detail
+        # The characters of "742 Evergreen Terrace" that appear nowhere
+        # else on the page, in the order the address first used them.
+        # 'T' is absent from this list because the page caption mentions
+        # ToUnicode, which puts a visible T back on the page.
+        assert "'742Evg'" in findings[0].detail
         assert findings[0].severity is prc.Severity.CRITICAL
+
+    def test_orphan_order_is_not_alphabetical(
+        self, prc: ModuleType, fixtures: Path
+    ) -> None:
+        """Sorting would destroy the evidence the CMap order carries."""
+        report, _ = prc.analyze(fixtures / "orphan_font.pdf", [])
+        finding = next(f for f in report.findings if f.check == prc.FONT_CHARSET)
+        assert "'247Egv'" not in finding.detail
 
     def test_orphan_font_check_needs_the_stale_cmap(
         self, prc: ModuleType, fixtures: Path

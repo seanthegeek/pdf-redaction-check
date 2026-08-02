@@ -17,6 +17,14 @@ and safe to paste into a bug report.
     orphan_font.pdf     stale ToUnicode CMap left by a post-hoc redaction
     tagged.pdf          secret survives in the tag tree, not on the page
     unapplied.pdf       /Redact annotation saved but never applied
+    annotated.pdf       secret in a comment and a form field value
+    attachments.pdf     secret in an embedded file
+    xmp.pdf             secret in the XMP metadata packet
+    font_variants.pdf   every shape of font dictionary the tool reads
+
+Most of these render identically -- a leak that showed on screen would
+not be a leak -- so each page carries a caption naming itself and what
+it hides. See CAPTIONS below.
 """
 
 from __future__ import annotations
@@ -38,8 +46,50 @@ BODY = [
 ]
 
 
-def letter_pdf(name: str, include_secret: bool = True, cover: bool = False) -> None:
-    """Write a one-page letter, optionally with the secret drawn on it."""
+# What each sample is, drawn on the page. Six of these documents are
+# byte-for-byte plausible as the same clean letter, because the leak in
+# each one is invisible by definition; the caption is the only way to
+# tell them apart in a viewer. No caption contains the secret.
+CAPTIONS = {
+    "clean.pdf": "Sample clean.pdf - nothing hidden anywhere",
+    "fake_redacted.pdf": "Sample fake_redacted.pdf - black box drawn over live text",
+    "orphan_font.pdf": "Sample orphan_font.pdf - stale ToUnicode CMap in the font",
+    "tagged.pdf": "Sample tagged.pdf - address survives in the tag tree",
+    "unapplied.pdf": "Sample unapplied.pdf - redaction mark saved but not applied",
+    "annotated.pdf": "Sample annotated.pdf - address in a comment and a form field",
+    "attachments.pdf": "Sample attachments.pdf - address in an embedded file",
+    "xmp.pdf": "Sample xmp.pdf - address in the XMP metadata packet",
+    "font_variants.pdf": "Sample font_variants.pdf - every font dictionary shape",
+}
+
+
+def page_text(caption: str, include_secret: bool) -> str:
+    """Return the visible text `letter_pdf` draws, in drawing order.
+
+    Kept next to `letter_pdf` because the two must agree: the orphaned
+    font sample builds its stale CMap from this text, and a CMap that
+    did not match what was drawn would test nothing.
+    """
+    parts = [BODY[0]]
+    if include_secret:
+        parts.append(SECRET)
+    parts += [BODY[1], BODY[2], caption]
+    return "".join(parts)
+
+
+def letter_pdf(
+    name: str,
+    caption: str,
+    include_secret: bool = True,
+    cover: bool = False,
+) -> None:
+    """Write a one-page letter, optionally with the secret drawn on it.
+
+    The caption names the sample and what is hidden in it. Most of these
+    documents are deliberately identical on screen -- that is the whole
+    premise of the tool -- so without it there is no way to tell which
+    file you have open.
+    """
     c = canvas.Canvas(str(SAMPLES / name), pagesize=letter)
     c.setFont("Helvetica", 12)
     c.drawString(72, 720, BODY[0])
@@ -50,6 +100,9 @@ def letter_pdf(name: str, include_secret: bool = True, cover: bool = False) -> N
     if cover:
         c.setFillColorRGB(0, 0, 0)
         c.rect(70, 694, 200, 16, fill=1, stroke=0)
+    c.setFillColorRGB(0.45, 0.45, 0.45)
+    c.setFont("Helvetica-Oblique", 9)
+    c.drawString(72, 600, caption)
     c.save()
 
 
@@ -88,18 +141,23 @@ def build_orphan_font() -> None:
     the CMap maps characters that appear nowhere on the page -- the
     remnant the Australian Signals Directorate documented.
     """
-    letter_pdf("orphan_font.pdf", include_secret=False)
-    original = BODY[0] + SECRET + BODY[1] + BODY[2]
+    caption = CAPTIONS["orphan_font.pdf"]
+    letter_pdf("orphan_font.pdf", caption, include_secret=False)
+    original = page_text(caption, include_secret=True)
     with pikepdf.open(SAMPLES / "orphan_font.pdf", allow_overwriting_input=True) as pdf:
         fonts = pdf.pages[0]["/Resources"]["/Font"]
+        # Only the font that drew the redacted line carries the remnant.
+        # The caption is set in a second, italic font that never rendered
+        # the address, so a stale CMap there would be fiction.
         for name in list(fonts.keys()):
-            fonts[name]["/ToUnicode"] = pdf.make_stream(build_cmap(original))
+            if str(fonts[name].get("/BaseFont", "")) == "/Helvetica":
+                fonts[name]["/ToUnicode"] = pdf.make_stream(build_cmap(original))
         pdf.save(SAMPLES / "orphan_font.pdf")
 
 
 def build_tagged() -> None:
     """A page whose text is clean but whose tag tree keeps the secret."""
-    letter_pdf("tagged.pdf", include_secret=False)
+    letter_pdf("tagged.pdf", CAPTIONS["tagged.pdf"], include_secret=False)
     with pikepdf.open(SAMPLES / "tagged.pdf", allow_overwriting_input=True) as pdf:
         span = pdf.make_indirect(
             pikepdf.Dictionary(
@@ -117,7 +175,7 @@ def build_tagged() -> None:
 
 def build_unapplied() -> None:
     """A page carrying redaction marks that were saved but never applied."""
-    letter_pdf("unapplied.pdf", include_secret=True)
+    letter_pdf("unapplied.pdf", CAPTIONS["unapplied.pdf"], include_secret=True)
     with pikepdf.open(SAMPLES / "unapplied.pdf", allow_overwriting_input=True) as pdf:
         page = pdf.pages[0]
         annot = pdf.make_indirect(
@@ -134,7 +192,7 @@ def build_unapplied() -> None:
 
 def build_annotated() -> None:
     """A clean page carrying the secret in a comment and a form field."""
-    letter_pdf("annotated.pdf", include_secret=False)
+    letter_pdf("annotated.pdf", CAPTIONS["annotated.pdf"], include_secret=False)
     with pikepdf.open(SAMPLES / "annotated.pdf", allow_overwriting_input=True) as pdf:
         comment = pdf.make_indirect(
             pikepdf.Dictionary(
@@ -165,7 +223,7 @@ def build_annotated() -> None:
 
 def build_attachments() -> None:
     """A clean page dragging an unredacted file along with it."""
-    letter_pdf("attachments.pdf", include_secret=False)
+    letter_pdf("attachments.pdf", CAPTIONS["attachments.pdf"], include_secret=False)
     with pikepdf.open(SAMPLES / "attachments.pdf", allow_overwriting_input=True) as pdf:
         spec = pikepdf.AttachedFileSpec(
             pdf,
@@ -182,7 +240,7 @@ def build_attachments() -> None:
 
 def build_xmp() -> None:
     """A clean page whose XMP packet still names the secret."""
-    letter_pdf("xmp.pdf", include_secret=False)
+    letter_pdf("xmp.pdf", CAPTIONS["xmp.pdf"], include_secret=False)
     packet = f"""<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/">
  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
@@ -208,7 +266,7 @@ def build_font_variants() -> None:
     characters live on a descendant. The fonts are never drawn with --
     the point is the metadata, not the rendering.
     """
-    letter_pdf("font_variants.pdf", include_secret=False)
+    letter_pdf("font_variants.pdf", CAPTIONS["font_variants.pdf"], include_secret=False)
     with pikepdf.open(
         SAMPLES / "font_variants.pdf", allow_overwriting_input=True
     ) as pdf:
@@ -290,8 +348,13 @@ def build_font_variants() -> None:
 def main() -> None:
     """Rewrite every fixture in tests/samples."""
     SAMPLES.mkdir(parents=True, exist_ok=True)
-    letter_pdf("clean.pdf", include_secret=False)
-    letter_pdf("fake_redacted.pdf", include_secret=True, cover=True)
+    letter_pdf("clean.pdf", CAPTIONS["clean.pdf"], include_secret=False)
+    letter_pdf(
+        "fake_redacted.pdf",
+        CAPTIONS["fake_redacted.pdf"],
+        include_secret=True,
+        cover=True,
+    )
     build_orphan_font()
     build_tagged()
     build_unapplied()
