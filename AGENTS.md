@@ -408,6 +408,20 @@ These standards apply to ALL project Python code **including tests**.
     produces both into `dist/`; check that the filenames carry the version being
     released rather than rebuilding blindly
 
+Publishing is automated. `.github/workflows/release.yml` fires when a GitHub
+release is published: it builds, verifies, uploads to PyPI, and attaches the
+artifacts to the release. Three things follow from that.
+
+- **Bump `version` in `pyproject.toml` before tagging.** The workflow refuses to
+  publish when the tag disagrees with the packaged version, because PyPI will not
+  let you reuse a version number to correct the mistake afterwards.
+- **There is no PyPI API token, and none should ever be added.** Publishing uses
+  Trusted Publishing: GitHub mints a short-lived OIDC token per run, bound to
+  this repository, the `release.yml` filename, and the `pypi` environment. If any
+  of those three change, update the publisher configuration on PyPI in the same
+  change — renaming the workflow file silently breaks releases.
+- **Manual runs go to TestPyPI, never PyPI.** `workflow_dispatch` is the dry run.
+
 ## Documentation
 
 The project must be well documented. If existing documentation exists, follow

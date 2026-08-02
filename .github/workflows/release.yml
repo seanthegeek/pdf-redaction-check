@@ -1,0 +1,146 @@
+# SPDX-FileCopyrightText: 2026 Sean Whalen
+# SPDX-License-Identifier: MIT
+#
+# Publishing uses PyPI Trusted Publishing (OIDC). There is no API token
+# anywhere in this repository or in its secrets: GitHub mints a
+# short-lived token per run, bound to this repository, this workflow
+# filename, and the environment named below. Configure the matching
+# publisher at https://pypi.org/manage/account/publishing/ with:
+#
+#   PyPI Project Name  pdf-redaction-check
+#   Owner              seanthegeek
+#   Repository name    pdf-redaction-check
+#   Workflow name      release.yml     <- the filename, not the name: below
+#   Environment name   pypi            <- must match `environment:` below
+#
+# Before the project exists on PyPI, register it as a *pending* publisher
+# on that same page. The first successful run creates the project and
+# converts the pending publisher into a normal one. Note that a pending
+# publisher does not reserve the name -- it is claimed on first publish.
+name: Release
+
+on:
+  # Publishing to PyPI happens only when a GitHub release is published.
+  release:
+    types: [published]
+  # Manual runs go to TestPyPI, never to PyPI, so this is safe to poke.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip && python -m pip install build twine
+
+      # A tag of v0.2.0 will otherwise happily publish 0.1.0, and PyPI
+      # will not let you reuse the version number to correct it.
+      - name: Check the tag matches the packaged version
+        if: github.event_name == 'release'
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version=$(python -c \
+            "import tomllib, pathlib; \
+             print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          expected="${TAG#v}"
+          if [ "$version" != "$expected" ]; then
+            echo "::error::tag $TAG implies version $expected, but pyproject.toml says $version"
+            exit 1
+          fi
+          echo "tag $TAG matches version $version"
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Check metadata
+        run: twine check dist/*
+
+      # The wheel renames the hyphenated script to an importable module.
+      # A broken mapping installs cleanly and only fails when someone
+      # runs the command, which is too late to find out during a release.
+      - name: Install the wheel and run the console script
+        run: |
+          python -m venv /tmp/smoketest
+          /tmp/smoketest/bin/pip install dist/*.whl
+          /tmp/smoketest/bin/pdf-redaction-check --help
+          /tmp/smoketest/bin/pdf-redaction-check \
+            tests/samples/tagged.pdf --dump-hidden
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+
+  pypi:
+    name: Publish to PyPI
+    needs: build
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      # The only permission this job holds. Trusted Publishing needs it
+      # to mint the OIDC token; nothing here can write to the repository.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+
+      # No username, no password, no token. The action generates PEP 740
+      # attestations from the same OIDC identity.
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  testpypi:
+    name: Publish to TestPyPI
+    needs: build
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+
+      # Needs its own pending publisher registered on test.pypi.org.
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  attach:
+    name: Attach artifacts to the release
+    needs: pypi
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+
+      # Runs after a successful publish, so the attached files are always
+      # the ones that actually reached PyPI.
+      - name: Upload sdist and wheel
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY"

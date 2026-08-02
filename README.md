@@ -202,6 +202,25 @@ on purpose: the hyphenated filename is renamed on the way into the wheel, and
 if that mapping breaks the package still installs while the command does not
 run.
 
+### Releasing
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) publishes to
+PyPI when a GitHub release is published. To cut one:
+
+1. Bump `version` in `pyproject.toml` and commit it.
+2. Tag with a `v` prefix and publish a GitHub release for that tag.
+
+The workflow builds, refuses to continue if the tag disagrees with the packaged
+version, installs the wheel and runs the command, publishes, and finally
+attaches the sdist and wheel to the release. Running it manually from the
+Actions tab publishes to TestPyPI instead, as a dry run.
+
+There is no PyPI API token in this repository. Publishing uses [Trusted
+Publishing][tp]: GitHub mints a short-lived credential for each run, scoped to
+this repository, this workflow file, and the `pypi` environment. Renaming the
+workflow file or the environment breaks releases until the publisher
+configuration on PyPI is updated to match.
+
 Run the script from the working tree during development. Do not use
 `pip install -e .`: the script filename is hyphenated, which is not a legal
 Python module name, so the build renames it on the way into the wheel — and that
@@ -244,3 +263,4 @@ MIT. See [LICENSE](LICENSE).
 
 [asd]: https://www.cyber.gov.au/sites/default/files/2023-03/PROTECT%20-%20An%20Examination%20of%20the%20Redaction%20Functionality%20of%20Adobe%20Acrobat%20Pro%20DC%202017%20(October%202021).pdf
 [pikepdf]: https://github.com/pikepdf/pikepdf
+[tp]: https://docs.pypi.org/trusted-publishers/
