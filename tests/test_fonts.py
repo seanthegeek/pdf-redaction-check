@@ -712,35 +712,115 @@ class TestOrphanSeverity:
         self, prc: ModuleType, fixtures: Path
     ) -> None:
         """A sample for each, so neither side is only ever asserted in
-        a document this suite built for itself."""
-        warned, _ = prc.analyze(fixtures / "broken_fonts.pdf", [])
+        a document this suite built for itself.
+
+        Both sides have to come from a document whose page text was read
+        in full, because a page that stopped short takes the threshold
+        out of the question entirely -- see
+        `TestAPartialBaselineInTheCorpus`. `font_variants.pdf` is such a
+        document and carries both sides at once.
+        """
+        report, _ = prc.analyze(fixtures / "font_variants.pdf", [])
         failed, _ = prc.analyze(fixtures / "orphan_font.pdf", [])
-        assert prc.verdict_code(warned) == prc.EXIT_SUSPICIOUS
+        severities = {
+            f.location: f.severity
+            for f in report.findings
+            if "absent from visible text" in f.detail
+        }
+        assert severities["page 1 /FCharSet"] is prc.Severity.WARNING
+        assert severities["page 1 /FDiff"] is prc.Severity.CRITICAL
         assert prc.verdict_code(failed) == prc.EXIT_RECOVERABLE
 
     def test_the_short_side_is_a_real_orphan_and_not_just_a_warning(
         self, prc: ModuleType, fixtures: Path
     ) -> None:
-        """What makes `broken_fonts.pdf` the sample for the short side.
+        """What makes `font_variants.pdf` the sample for the short side.
 
-        Its /FBadWidth declares two codes and the page draws one of
-        them, so the other is a single orphan. The verdict above would
-        stay SUSPICIOUS on the strength of the unreadable fonts alone,
-        which is why the finding itself is asserted here: anything later
-        added to the sample that happens to draw a C would take the
-        one-orphan case away without failing a test.
+        Its /FCharSet lists ten glyph names and the page draws nine of
+        them, so the tenth is a single orphan. The verdict of that
+        document is a failure on the strength of its /FDiff alone, which
+        is why the finding itself is asserted here: anything later added
+        to the sample that happens to draw a 9 would take the one-orphan
+        case away without failing a test.
         """
-        report, _ = prc.analyze(fixtures / "broken_fonts.pdf", [])
+        report, _ = prc.analyze(fixtures / "font_variants.pdf", [])
         orphans = [
             f
             for f in report.findings
-            if f.location == "page 1 /FBadWidth"
+            if f.location == "page 1 /FCharSet"
             and "absent from visible text" in f.detail
         ]
         assert len(orphans) == 1
         assert orphans[0].severity is prc.Severity.WARNING
         assert "1 character(s)" in orphans[0].detail
+        assert repr("9") in orphans[0].detail
+
+
+class TestAPartialBaselineInTheCorpus:
+    """A committed document whose page text could not be read in full.
+
+    `broken_fonts.pdf` draws two bytes with a /Font resource that is a
+    number, so those two bytes are text the page draws that nothing here
+    could turn into characters. That makes the page text less than what
+    the page draws, and a font's leftovers cannot be told from characters
+    this never saw -- so the finding says what it observed instead of
+    asserting a removal. The sample is the corpus's fixture for that
+    path: with the signal taken out, its /FBadWidth finding goes back to
+    claiming a passage was removed from a page it did not finish reading.
+    """
+
+    def test_the_finding_fires_and_lists_the_character(
+        self, prc: ModuleType, fixtures: Path
+    ) -> None:
+        """Weakening the inference is not dropping the finding."""
+        report, _ = prc.analyze(fixtures / "broken_fonts.pdf", [])
+        orphans = [
+            f
+            for f in report.findings
+            if f.location == "page 1 /FBadWidth"
+            and "mapped by the font subset" in f.detail
+        ]
+        assert len(orphans) == 1
+        assert "1 character(s)" in orphans[0].detail
         assert repr("C") in orphans[0].detail
+
+    def test_the_finding_names_the_page_it_could_not_finish(
+        self, prc: ModuleType, fixtures: Path
+    ) -> None:
+        """The observation and the inference, stated apart.
+
+        The strong wording would say the character is absent from the
+        visible text, which this run is in no position to claim.
+        """
+        report, _ = prc.analyze(fixtures / "broken_fonts.pdf", [])
+        detail = next(
+            f.detail
+            for f in report.findings
+            if f.location == "page 1 /FBadWidth"
+            and "mapped by the font subset" in f.detail
+        )
+        assert "absent from the page text this could read" in detail
+        assert "the text of page 1 could not be read in full" in detail
+        assert "absent from visible text" not in detail
+        assert "consistent with text removed" not in detail
+
+    def test_the_page_that_could_not_be_read_is_reported_beside_it(
+        self, prc: ModuleType, fixtures: Path
+    ) -> None:
+        """The other half of the pair: the finding it agrees with.
+
+        The two used to contradict each other -- one saying the page
+        text could not be read, the other drawing an inference that
+        needs it read.
+        """
+        report, _ = prc.analyze(fixtures / "broken_fonts.pdf", [])
+        content = [
+            f
+            for f in report.findings
+            if f.check == prc.CONTENT_STREAM and f.location == "page 1"
+        ]
+        assert len(content) == 1
+        assert "/FScalar" in content[0].detail
 
 
 class TestUnreadableFontDictionaries:

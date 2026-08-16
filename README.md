@@ -231,6 +231,22 @@ it states its own uncertainty:
 CRITICAL font-charset [page 1 /F1]: 6 character(s) mapped by the font subset but absent from visible text, in CMap order: '742Evg' -- consistent with text removed from the content stream but not the font subset
 ```
 
+That inference needs the page text it compared against to be the whole of the
+page text. When any page could not be read in full — for any of the reasons
+listed under `content-stream` above — the same check reports what it observed
+instead, names the pages that went unread, and drops to a `WARNING`, because a
+character missing from a comparison this could not finish may be one the
+document is still showing:
+
+```text
+WARNING  font-charset [page 1 /F1]: 3 character(s) mapped by the font subset but absent from the page text this could read, in CMap order: 'ÁÂÃ' -- the text of page 1 could not be read in full, so these may be characters the document still shows that this run never saw, rather than characters removed from the content stream
+```
+
+Every character is still listed and the finding is still made; only the
+inference changes. It reaches every font in the document rather than only the
+fonts of the page that went unread, because the text a font is compared against
+is every page's joined together.
+
 `--json` emits the same findings as an object, for a CI gate that needs to do
 more than branch on the exit code:
 
@@ -330,6 +346,14 @@ words — see the warning above.
 
 Suitable for a pre-send hook or CI gate.
 
+`2` says the evidence shows content that was meant to be removed is still
+recoverable, so a check whose evidence rests on something this could not read
+does not reach it. The font-subset check is the one that turns on a comparison
+against the page text: when a page could not be read in full, its findings are
+`WARNING`s, and such a document ends on `1` unless something else convicts it.
+That is not a change to what a code means — it is which code the evidence
+supports.
+
 `3` covers the three ways a run can end without a verdict: the PDF could not be
 read, the `--output` path was unusable, or writing the output failed. `4` is
 reserved for a bad invocation — an unknown option, a missing file argument, an
@@ -367,15 +391,17 @@ file is clean.
   the same number of bytes wide, leaves codes this cannot turn into characters.
   Those codes are dropped from the page text and reported as a warning rather
   than guessed at, so the visible-text comparison is incomplete for exactly
-  those documents. A `/Differences` array can also name a glyph this does not
-  know — the names it resolves are the standard ones of ISO 32000 Annex D, the
-  four-digit `uniXXXX` and the four- to six-digit `uXXXX` hexadecimal forms,
-  and the Unicode character names, so a producer that
-  invents a name, or takes one from a symbol font, is naming a glyph this cannot
-  identify. That code then keeps whatever the font's base encoding says it
-  draws, which may be a character the page never showed, and nothing is reported.
-  Prefer `--secret` on such files: the raw-object sweep works on bytes and does
-  not depend on the font at all.
+  those documents — and the font-subset finding says so and drops to a
+  `WARNING`, rather than reporting characters this never saw as characters the
+  document no longer draws. A `/Differences` array can also name a glyph this
+  does not know — the names it resolves are the standard ones of ISO 32000
+  Annex D, the four-digit `uniXXXX` and the four- to six-digit `uXXXX`
+  hexadecimal forms, and the Unicode character names, so a producer that
+  invents a name, or takes one from a symbol font, is naming a glyph this
+  cannot identify. That code then keeps whatever the font's base encoding says
+  it draws, which may be a character the page never showed, and nothing is
+  reported. Prefer `--secret` on such files: the raw-object sweep works on
+  bytes and does not depend on the font at all.
 - **Non-ASCII text in the catch-all string sweep.** Strings that no dedicated
   layer claims are filtered by how much plain ASCII they contain, to keep
   binary values out of the output. Text in scripts that use little ASCII may be

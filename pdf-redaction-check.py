@@ -48,7 +48,7 @@ import sys
 import unicodedata
 import zlib
 from collections import deque
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -2052,7 +2052,11 @@ def _page_text(page: pikepdf.Page) -> tuple[str, list[str], list[str]]:
     return "".join(found.out), problems + found.problems, found.stops
 
 
-def extract_page_text(pdf: pikepdf.Pdf, report: Report | None = None) -> str:
+def extract_page_text(
+    pdf: pikepdf.Pdf,
+    report: Report | None = None,
+    partial: list[int] | None = None,
+) -> str:
     """Return the text the pages draw, decoded through their own fonts.
 
     This is not `pdftotext`. There is no layout analysis and nothing is
@@ -2067,6 +2071,21 @@ def extract_page_text(pdf: pikepdf.Pdf, report: Report | None = None) -> str:
     instead, as the other walks do: it counts branches rather than
     listing them, so an object to point at is the only thing that says
     where to start looking.
+
+    `partial` is the list the number of every page whose text could not
+    be read in full is appended to, in page order, for a caller that
+    needs to know how much of the page text it is holding --
+    `check_fonts` does, because comparing a font against the page text
+    only says something about the document when the page text is all of
+    it. None means this caller is not collecting the page numbers, which
+    is what a test reading this layer on its own wants, and never means
+    every page was read in full.
+
+    A page counts as read in full exactly when nothing about it was
+    reported. That is the same test the findings are built from, on
+    purpose: anything this could not read is text the page may draw and
+    this did not see, and deriving both from the one list is what stops
+    the report and the font check contradicting each other.
     """
     chunks: list[str] = []
     for index, page in enumerate(pdf.pages, start=1):
@@ -2077,6 +2096,8 @@ def extract_page_text(pdf: pikepdf.Pdf, report: Report | None = None) -> str:
         text, decoded, stops = _page_text(page)
         chunks.append(text)
         problems += decoded
+        if partial is not None and (problems or stops):
+            partial.append(index)
         if report is not None:
             for problem in problems:
                 report.add(Severity.WARNING, CONTENT_STREAM, problem, f"page {index}")
@@ -2858,10 +2879,70 @@ def check_attachments(pdf: pikepdf.Pdf, report: Report) -> None:
     )
 
 
-def check_fonts(pdf: pikepdf.Pdf, report: Report, visible_text: str) -> None:
-    """Detect orphaned glyph mappings left behind by post-hoc redaction."""
+def partial_pages_note(pages: Sequence[int]) -> str:
+    """Name the pages whose text could not be read in full.
+
+    One page is named outright. More are counted and the first named, as
+    every other count here is: an operator needs to know how much went
+    unread and where to start looking, and a document built to stop on
+    every page would otherwise put a page number on the report for each
+    of them.
+
+    Raises ValueError when `pages` is empty. There is no such thing as a
+    note about no pages, and the caller decides which of two findings to
+    build by whether any page went unread, so an empty list here means
+    the strong finding was built as the weak one.
+    """
+    if not pages:
+        raise ValueError("partial_pages_note needs at least one page number")
+    if len(pages) == 1:
+        return f"page {pages[0]}"
+    return f"{len(pages)} pages, the first of them page {pages[0]}"
+
+
+def check_fonts(
+    pdf: pikepdf.Pdf,
+    report: Report,
+    visible_text: str,
+    partial_pages: Sequence[int] = (),
+) -> None:
+    """Detect orphaned glyph mappings left behind by post-hoc redaction.
+
+    `partial_pages` is the pages whose text could not be read in full,
+    from `extract_page_text`. A character this cannot account for is
+    only evidence of a removed passage when the text it was compared
+    against is the whole of the page text -- so when any page went
+    unread, the finding says what it observed, that the characters are
+    absent from the text this could read, and names the pages that make
+    that less than the page text. The characters are still listed and
+    the finding is still made: what changes is the inference drawn from
+    it, and with it the severity, because the evidence for "the content
+    is recoverable" is what went missing along with the page text.
+
+    That reaches every font, not only the fonts of the pages that went
+    unread. The text a font is compared against is every page's joined
+    together, so a page this could not finish leaves characters out of
+    the comparison whatever page the font was reached through -- and
+    fonts are shared between pages, so the missing characters are often
+    exactly the ones the font in hand declares.
+    """
     for label, orphans in font_orphans(pdf, visible_text, report):
         sample = "".join(orphans)[:60]
+        if partial_pages:
+            report.add(
+                Severity.WARNING,
+                FONT_CHARSET,
+                (
+                    f"{len(orphans)} character(s) mapped by the font subset but "
+                    "absent from the page text this could read, in CMap order: "
+                    f"{sample!r} -- the text of {partial_pages_note(partial_pages)} "
+                    "could not be read in full, so these may be characters the "
+                    "document still shows that this run never saw, rather than "
+                    "characters removed from the content stream"
+                ),
+                label,
+            )
+            continue
         severity = Severity.WARNING if len(orphans) < 3 else Severity.CRITICAL
         report.add(
             severity,
@@ -2943,8 +3024,12 @@ def analyze(
     reject_blank_secrets(secrets)
     report = Report(path=path)
     extracts: list[Extract] = []
+    # The pages whose text could not be read in full. `check_fonts`
+    # compares what a font declares against the page text, so it has to
+    # know when the page text is less than what the pages draw.
+    partial_pages: list[int] = []
     with pikepdf.open(path) as pdf:
-        visible_text = extract_page_text(pdf, report)
+        visible_text = extract_page_text(pdf, report, partial_pages)
         if want_extracts or secrets:
             extracts = collect_extracts(pdf, visible_text, report)
         if secrets:
@@ -2954,7 +3039,7 @@ def analyze(
         check_redact_annotations(pdf, report)
         check_metadata(pdf, report)
         check_attachments(pdf, report)
-        check_fonts(pdf, report, visible_text)
+        check_fonts(pdf, report, visible_text, partial_pages)
     return report, extracts if want_extracts else []
 
 

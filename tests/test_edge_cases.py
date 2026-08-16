@@ -346,25 +346,36 @@ class TestAPageThatStopsPartWayThrough:
         assert [f for f in report.findings if f.check == prc.FONT_CHARSET] == []
         assert prc.verdict_code(report) == prc.EXIT_SUSPICIOUS
 
-    def test_the_font_is_called_a_leftover_when_the_text_really_is_gone(
+    def test_the_font_is_still_reported_when_no_text_accounts_for_it(
         self, prc: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The other half: keeping the text is not quieting the check.
 
         The same page, stopping at the same point, with the drawing
-        instruction taken out -- so the three characters the font
-        declares really are characters nothing on the page shows. The
-        finding this is meant to leave standing is exactly the one the
-        test above is meant to stop being invented.
+        instruction taken out -- so nothing this read accounts for the
+        three characters the font declares. The finding this is meant to
+        leave standing is exactly the one the test above is meant to
+        stop being invented.
+
+        It is the weaker of the two findings, because this page stopped
+        part way through and what it would have drawn after that is not
+        known; `TestFontFindingsAgainstAPartialBaseline` is where that
+        is settled, and where the strong finding is proved to survive on
+        a page that reads to the end.
         """
         path = self.build(tmp_path, self.SELECTS_A_BAD_FONT)
         self.unreadable_after(prc, monkeypatch)
         report, _ = prc.analyze(path, [])
-        orphans = [f for f in report.findings if f.check == prc.FONT_CHARSET]
+        orphans = [
+            f
+            for f in report.findings
+            if f.check == prc.FONT_CHARSET and "mapped by the font subset" in f.detail
+        ]
         assert len(orphans) == 1
-        assert orphans[0].severity is prc.Severity.CRITICAL
+        assert orphans[0].severity is prc.Severity.WARNING
         assert self.DRAWN in orphans[0].detail
-        assert prc.verdict_code(report) == prc.EXIT_RECOVERABLE
+        assert "could not be read in full" in orphans[0].detail
+        assert prc.verdict_code(report) == prc.EXIT_SUSPICIOUS
 
     def test_what_the_page_dropped_is_said_even_though_it_stopped(
         self, prc: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -405,6 +416,228 @@ class TestAPageThatStopsPartWayThrough:
         details = [f.detail for f in report.findings]
         assert [d for d in details if "nested more than" in d]
         assert [d for d in details if "content stream could not be parsed" in d]
+
+
+# The standard PostScript names of three characters no other part of
+# these documents uses, and the characters themselves. A font declaring
+# exactly these declares nothing an ordinary page could account for.
+PARTIAL_GLYPH_NAMES = ("Aacute", "Acircumflex", "Atilde")
+PARTIAL_CHARS = "ÁÂÃ"
+
+# Drawing instructions that select the font above and draw its three
+# characters, whose codes are 1 to 3 -- control codes in every base
+# encoding, so what they spell is decided entirely by the /Differences
+# array that font carries.
+PARTIAL_DRAWS_THEM = b"BT /F1 12 Tf <010203> Tj ET\n"
+
+# The same instructions with the drawing taken out: a page that reads to
+# the end and really does show none of the three.
+PARTIAL_DRAWS_NOTHING = b"BT /F1 12 Tf ET\n"
+
+
+class TestFontFindingsAgainstAPartialBaseline:
+    """A font's leftovers are only leftovers if the page text was read.
+
+    The font-subset check compares what a font declares against the text
+    the pages draw, and reads a character it cannot account for as
+    consistent with a passage removed from the content stream. That
+    inference needs the page text to be the whole page text. When a page
+    could not be read to the end, a character missing from the
+    comparison may be one the page is still showing and this run never
+    saw, so the finding says what it observed instead of asserting a
+    removal -- it still fires, and it still lists every character.
+
+    The baseline is the text of every page joined together, so a page
+    this could not finish weakens the finding for a font reached through
+    any page, not only through that one. A font subset is shared between
+    the pages that use it, and the same characters appear on more than
+    one page, so a character absent from the joined text may be one the
+    unread part of some other page draws.
+    """
+
+    def font(self, pdf: pikepdf.Pdf) -> pikepdf.Object:
+        """Return the font that maps codes 1 upwards to three characters."""
+        return pdf.make_indirect(
+            pikepdf.Dictionary(
+                Type=pikepdf.Name("/Font"),
+                Subtype=pikepdf.Name("/Type1"),
+                BaseFont=pikepdf.Name("/Helvetica"),
+                Encoding=pikepdf.Dictionary(
+                    Type=pikepdf.Name("/Encoding"),
+                    Differences=[
+                        1,
+                        *(pikepdf.Name(f"/{n}") for n in PARTIAL_GLYPH_NAMES),
+                    ],
+                ),
+            )
+        )
+
+    def unreadable_stream(self, pdf: pikepdf.Pdf) -> pikepdf.Object:
+        """Return a content stream whose declared filter will not run.
+
+        The bytes are not compressed data, and the stream says they are,
+        so every reader of it -- qpdf's content parser included -- stops
+        before a single instruction is handed over. That is a page whose
+        text was not read at all, and it is a cause no fallback can
+        recover from: there is one stream and its bytes are unreachable.
+        """
+        stream = pdf.make_stream(b"BT /F1 12 Tf <010203> Tj ET\n")
+        stream.stream_dict["/Filter"] = pikepdf.Name("/FlateDecode")
+        return pdf.make_indirect(stream)
+
+    def build(self, tmp_path: Path, *pages: bytes | None) -> Path:
+        """Write a document of one page per argument.
+
+        Each argument is the page's drawing instructions, or None for a
+        page whose stream declares a filter that will not run. Every
+        page defines /F1 as the font above.
+        """
+        path = tmp_path / "partial.pdf"
+        with pikepdf.new() as pdf:
+            font = self.font(pdf)
+            for body in pages:
+                page = pdf.add_blank_page()
+                page.Resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=font))
+                page.obj["/Contents"] = (
+                    self.unreadable_stream(pdf)
+                    if body is None
+                    else pdf.make_stream(body)
+                )
+            pdf.save(path, stream_decode_level=pikepdf.StreamDecodeLevel.none)
+        return path
+
+    def orphan_findings(self, prc: ModuleType, path: Path) -> list[Any]:
+        """Return the font-subset findings a full run reports."""
+        report, _ = prc.analyze(path, [])
+        return [
+            f
+            for f in report.findings
+            if f.check == prc.FONT_CHARSET and "mapped by the font subset" in f.detail
+        ]
+
+    def test_a_page_read_in_full_still_convicts_its_font(
+        self, prc: ModuleType, tmp_path: Path
+    ) -> None:
+        """The negative half, and the check's whole reason for existing.
+
+        The page reads to the end and shows none of the three characters
+        its font declares, so the strong inference is the right one. If
+        this stops being CRITICAL, the tool's main check has been
+        quieted rather than made more precise.
+        """
+        path = self.build(tmp_path, PARTIAL_DRAWS_NOTHING)
+        report, _ = prc.analyze(path, [])
+        findings = self.orphan_findings(prc, path)
+        assert len(findings) == 1
+        assert findings[0].severity is prc.Severity.CRITICAL
+        assert PARTIAL_CHARS in findings[0].detail
+        assert "absent from visible text" in findings[0].detail
+        assert "consistent with text removed" in findings[0].detail
+        assert "could not be read in full" not in findings[0].detail
+        assert prc.verdict_code(report) == prc.EXIT_RECOVERABLE
+
+    def test_a_partial_page_weakens_the_finding_without_dropping_it(
+        self, prc: ModuleType, tmp_path: Path
+    ) -> None:
+        """The finding still fires and still lists every character.
+
+        Only the inference changes: the characters are absent from what
+        this could read, which is not the same as absent from the page.
+        """
+        path = self.build(tmp_path, None)
+        findings = self.orphan_findings(prc, path)
+        assert len(findings) == 1
+        assert PARTIAL_CHARS in findings[0].detail
+        assert "3 character(s)" in findings[0].detail
+        assert "consistent with text removed" not in findings[0].detail
+        assert "could not be read in full" in findings[0].detail
+        assert "page 1" in findings[0].detail
+
+    def test_a_partial_page_lowers_the_severity_to_a_warning(
+        self, prc: ModuleType, tmp_path: Path
+    ) -> None:
+        """Weaker evidence, weaker verdict.
+
+        Exit 2 says the redacted content is recoverable. Nothing here
+        shows content was removed at all, so the run ends suspicious --
+        which it would anyway, on the content-stream warning beside it.
+        """
+        path = self.build(tmp_path, None)
+        report, _ = prc.analyze(path, [])
+        findings = self.orphan_findings(prc, path)
+        assert len(findings) == 1
+        assert findings[0].severity is prc.Severity.WARNING
+        assert prc.verdict_code(report) == prc.EXIT_SUSPICIOUS
+
+    def test_one_partial_page_weakens_a_font_reached_through_another(
+        self, prc: ModuleType, tmp_path: Path
+    ) -> None:
+        """The baseline is the whole document's text, so the reach is too.
+
+        Page 2 reads to the end. The font it names is the same subset
+        page 1 names, and page 1 stopped before a single instruction --
+        so a character neither page accounts for may be one page 1 is
+        still showing.
+        """
+        path = self.build(tmp_path, None, PARTIAL_DRAWS_NOTHING)
+        findings = self.orphan_findings(prc, path)
+        assert {f.location for f in findings} == {"page 1 /F1", "page 2 /F1"}
+        for finding in findings:
+            assert finding.severity is prc.Severity.WARNING
+            assert "could not be read in full" in finding.detail
+
+    def test_the_partial_pages_are_named_in_the_finding(
+        self, prc: ModuleType, tmp_path: Path
+    ) -> None:
+        """An operator told the baseline is partial needs to know where.
+
+        Two pages of three cannot be read, so the finding counts them
+        and names the first, the way every other count here does.
+        """
+        path = self.build(tmp_path, None, PARTIAL_DRAWS_NOTHING, None)
+        findings = self.orphan_findings(prc, path)
+        assert findings
+        for finding in findings:
+            assert "2 pages" in finding.detail
+            assert "the first of them page 1" in finding.detail
+
+    def test_extract_page_text_records_which_pages_it_could_not_finish(
+        self, prc: ModuleType, tmp_path: Path
+    ) -> None:
+        """The signal is collected where the problems are, so they agree.
+
+        A page is partial exactly when something about it was reported,
+        which is what stops the report and the font check contradicting
+        each other.
+        """
+        path = self.build(tmp_path, PARTIAL_DRAWS_THEM, None, PARTIAL_DRAWS_NOTHING)
+        partial: list[int] = []
+        with pikepdf.open(path) as pdf:
+            text = prc.extract_page_text(pdf, None, partial)
+        assert PARTIAL_CHARS in text
+        assert partial == [2]
+
+    def test_a_document_read_in_full_records_no_partial_pages(
+        self, prc: ModuleType, tmp_path: Path
+    ) -> None:
+        """The negative half of the collector: nothing wrong, nothing said."""
+        path = self.build(tmp_path, PARTIAL_DRAWS_THEM, PARTIAL_DRAWS_NOTHING)
+        partial: list[int] = []
+        with pikepdf.open(path) as pdf:
+            prc.extract_page_text(pdf, None, partial)
+        assert partial == []
+
+    def test_nobody_has_to_collect_the_partial_pages(
+        self, prc: ModuleType, tmp_path: Path
+    ) -> None:
+        """A caller reading one layer in isolation passes nothing.
+
+        The page still stops, and the text it managed is still returned
+        -- the collector being absent is not the page being fine.
+        """
+        path = self.build(tmp_path, None)
+        with pikepdf.open(path) as pdf:
+            assert prc.extract_page_text(pdf) == ""
 
 
 # One line of drawing instructions, for the pages that are meant to be
@@ -1895,6 +2128,27 @@ class TestProblemNotes:
         """
         with pytest.raises(ValueError, match="at least one branch"):
             prc.depth_limit_note("the tag tree", [])
+
+    def test_one_partial_page_is_named_and_several_are_counted(
+        self, prc: ModuleType
+    ) -> None:
+        assert prc.partial_pages_note([4]) == "page 4"
+        note = prc.partial_pages_note([4, 9])
+        assert "2 pages" in note
+        assert "the first of them page 4" in note
+
+    def test_a_partial_page_note_about_no_pages_is_refused(
+        self, prc: ModuleType
+    ) -> None:
+        """No page went unread means the strong finding was the right one.
+
+        Which of the two font-subset findings to build is decided by
+        whether this list has anything in it, so an empty one arriving
+        here is a caller that built the weak finding for a document it
+        read in full.
+        """
+        with pytest.raises(ValueError, match="at least one page"):
+            prc.partial_pages_note([])
 
     def test_text_shown_as_an_array(self, prc: ModuleType, tmp_path: Path) -> None:
         """TJ takes an array of strings and kerning numbers."""

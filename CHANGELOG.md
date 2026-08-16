@@ -25,6 +25,22 @@ bump.
 
 ### Fixed
 
+- A font's leftover character mappings are no longer reported as a removed
+  passage when the page text they were compared against could not be read in
+  full. The font-subset check reads a character it cannot account for in the
+  page text as consistent with text removed from the content stream, which only
+  follows if the page text is all of the text the pages draw — so a page this
+  could not finish reading used to produce a `CRITICAL` and exit code `2` on a
+  page still showing the characters in question, contradicting the
+  `content-stream` warning printed three lines above it. The finding still
+  fires and still lists every character; what changes is that it reports them
+  as absent from the page text this could read, names the pages that went
+  unread, and is a `WARNING` rather than a `CRITICAL`, because the evidence for
+  "the content is recoverable" went missing along with the page text. Any page
+  that could not be read in full has this effect on every font in the document,
+  not only on the fonts of that page, because the text a font is compared
+  against is every page's joined together. A document whose pages were all read
+  to the end is unaffected, and still convicts.
 - A page's drawing instructions are now read one at a time instead of all at
   once, so how many of them a page holds no longer decides what reading it
   costs. Instructions compress extremely well — a `q` is two bytes — so a
