@@ -182,8 +182,11 @@ outside the text layer reports under two names: `raw-objects` for stream data,
 - `content-stream`: a page whose drawing instructions will not parse all the
   way through, or a form drawn on the page whose own will not — either of which
   costs the text drawn from the point they stopped at and not the text drawn
-  before it; a page whose `/Contents` is neither a content stream nor an array
-  of them, or an entry of that array that is not a content stream, either of
+  before it; a page whose `/Contents` is an array of content streams that will
+  not read as one, which is how a reader reads them, or an entry of such an
+  array that will not read on its own either — see "Limitations"; a page whose
+  `/Contents` is neither a content stream nor an array of them, or an entry of
+  that array that is not a content stream, either of
   which a parser hands back no instructions for rather than refusing; a form
   drawn by a name nothing defines; forms drawn inside one another more than 64
   levels deep, which is where every walk here stops — see "Limitations"; text
@@ -402,6 +405,29 @@ file is clean.
   it draws, which may be a character the page never showed, and nothing is
   reported. Prefer `--secret` on such files: the raw-object sweep works on
   bytes and does not depend on the font at all.
+- **An array of content streams that will not read as one.** A page's drawing
+  instructions can be an array of content streams, and ISO 32000 section 7.8.2
+  makes them one stream, divided only at the boundaries between tokens — so a
+  reader joins them before parsing, and so does this. One entry that will not
+  decode therefore costs the text of every other, because the parse of the
+  joined stream hands over no instructions at all. When that happens the
+  entries are read one at a time instead, carrying the font in effect and the
+  saved graphics states across every join that could be read across, so the
+  readable entries' text is recovered and each entry that would not read is
+  named by its object. Two things cannot be recovered that way, and neither is
+  guessed at. An instruction written across the join beside the entry that
+  failed is split between the two, so its operands or its operator went with
+  that entry. And an entry that would not read may have selected another font,
+  or saved or restored the graphics state, so what it would have left behind is
+  not known and is not carried past it: from there on the text reads as text
+  drawn with no font selected, which shows up among the counts of text this
+  could not turn into characters. ISO 32000 section 9.3.1 gives the font no
+  initial value and wants a `Tf` before any text is shown, so text a reader
+  would draw after that point brings its own font and is still recovered.
+  Neither case draws the wrong characters — an invented character can land on a
+  font mapping that really was orphaned and hide a leak, which is worse than
+  losing the text. A page read this way is not a page read in full, so its
+  fonts get the weaker of the two font-subset findings.
 - **Non-ASCII text in the catch-all string sweep.** Strings that no dedicated
   layer claims are filtered by how much plain ASCII they contain, to keep
   binary values out of the output. Text in scripts that use little ASCII may be

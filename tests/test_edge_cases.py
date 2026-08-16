@@ -482,7 +482,7 @@ class TestFontFindingsAgainstAPartialBaseline:
         recover from: there is one stream and its bytes are unreachable.
         """
         stream = pdf.make_stream(b"BT /F1 12 Tf <010203> Tj ET\n")
-        stream.stream_dict["/Filter"] = pikepdf.Name("/FlateDecode")
+        stream["/Filter"] = pikepdf.Name("/FlateDecode")
         return pdf.make_indirect(stream)
 
     def build(self, tmp_path: Path, *pages: bytes | None) -> Path:
@@ -503,7 +503,7 @@ class TestFontFindingsAgainstAPartialBaseline:
                     if body is None
                     else pdf.make_stream(body)
                 )
-            pdf.save(path, stream_decode_level=pikepdf.StreamDecodeLevel.none)
+            pdf.save(path)
         return path
 
     def orphan_findings(self, prc: ModuleType, path: Path) -> list[Any]:
@@ -640,6 +640,361 @@ class TestFontFindingsAgainstAPartialBaseline:
             assert prc.extract_page_text(pdf) == ""
 
 
+class TestAContentsArrayReadOneEntryAtATime:
+    """One unreadable entry used to cost the whole array's text.
+
+    ISO 32000 section 7.8.2 makes an array of content streams one
+    stream, divided only at the boundaries between tokens, so a reader
+    joins the entries before parsing -- and so does qpdf. Joining them
+    means that when any one entry will not decode, the parse of the
+    whole array hands over no objects at all: the readable entries' text
+    is lost inside qpdf rather than by anything here. A page still
+    drawing that text then had nothing to account for the characters its
+    fonts declare.
+
+    So a joined parse that stops is followed by a second pass that reads
+    the entries one at a time. The danger to design against is not
+    losing text -- that is loud, and an operator can look at the page --
+    but inventing it: a character this puts into the page text that the
+    page never drew can land on a mapping that really was orphaned and
+    hide a genuine leak. Reading each entry with a fresh graphics state
+    would do exactly that, decoding the text after an entry boundary
+    through whatever font the entry before it had selected, so the font
+    in effect and the stack of saved states carry across. The entries
+    are one stream; only the reading of them is split.
+    """
+
+    # Three characters no ordinary page draws, as the standard
+    # PostScript names of them, mapped to codes 1 upwards -- control
+    # codes in every base encoding, so what they spell is decided
+    # entirely by the /Differences array.
+    NAMES = ("Aacute", "Acircumflex", "Atilde")
+    DRAWN = "ÁÂÃ"
+    # A second font, whose codes 1 upwards draw three other characters.
+    # Text decoded through the wrong one of the two spells the wrong
+    # word, which is what makes the pair worth having.
+    OTHER_NAMES = ("Ugrave", "Ydieresis", "Zcaron")
+    OTHER_DRAWN = "ÙŸŽ"
+
+    def font(self, pdf: pikepdf.Pdf, names: tuple[str, ...]) -> pikepdf.Object:
+        """Return a font mapping codes 1 upwards to `names`."""
+        return pdf.make_indirect(
+            pikepdf.Dictionary(
+                Type=pikepdf.Name("/Font"),
+                Subtype=pikepdf.Name("/Type1"),
+                BaseFont=pikepdf.Name("/Helvetica"),
+                Encoding=pikepdf.Dictionary(
+                    Type=pikepdf.Name("/Encoding"),
+                    Differences=[1, *(pikepdf.Name(f"/{n}") for n in names)],
+                ),
+            )
+        )
+
+    def build(self, tmp_path: Path, *entries: bytes | None) -> Path:
+        """Write a one-page document whose /Contents is these entries.
+
+        Each argument is one entry of the array, or None for an entry
+        that says it is compressed and is not -- which no reader can
+        decode, and which no producer writes. That is why this is built
+        here rather than added to `tests/samples`: it is a deliberately
+        invalid structure, like the rest of this file's inputs.
+
+        /FA and /FB are the two fonts above. The document is written out
+        and read back because that is the path a run takes.
+        """
+        path = tmp_path / "array.pdf"
+        with pikepdf.new() as pdf:
+            page = pdf.add_blank_page()
+            page.Resources = pikepdf.Dictionary(
+                Font=pikepdf.Dictionary(
+                    FA=self.font(pdf, self.NAMES),
+                    FB=self.font(pdf, self.OTHER_NAMES),
+                )
+            )
+            array: list[pikepdf.Object] = []
+            for body in entries:
+                stream = pdf.make_stream(b"q Q\n" if body is None else body)
+                if body is None:
+                    stream["/Filter"] = pikepdf.Name("/FlateDecode")
+                array.append(pdf.make_indirect(stream))
+            page.obj["/Contents"] = pikepdf.Array(array)
+            pdf.save(path)
+        return path
+
+    def read(self, prc: ModuleType, path: Path) -> tuple[str, Any]:
+        """Read the page text of the document at `path`, with a report."""
+        report = prc.Report(path=path)
+        with pikepdf.open(path) as pdf:
+            return prc.extract_page_text(pdf, report), report
+
+    def details(self, report: Any) -> list[str]:
+        """Return every finding's detail text."""
+        return [f.detail for f in report.findings]
+
+    def test_the_readable_entry_reaches_the_page_text(
+        self, prc: ModuleType, tmp_path: Path
+    ) -> None:
+        """The reported bug: text on the page, absent from the page text."""
+        path = self.build(tmp_path, b"BT /FA 12 Tf <010203> Tj ET\n", None)
+        text, _ = self.read(prc, path)
+        assert text == self.DRAWN
+
+    def test_the_entry_that_could_not_be_read_is_named_by_object(
+        self, prc: ModuleType, tmp_path: Path
+    ) -> None:
+        """Reading around a failure does not make the failure go away.
+
+        The entry is named by its position in the array and by its
+        object number, so an operator can go and look at the one stream
+        this could not read.
+        """
+        path = self.build(tmp_path, b"BT /FA 12 Tf <010203> Tj ET\n", None)
+        _, report = self.read(prc, path)
+        entry = [d for d in self.details(report) if "entry 2" in d]
+        assert len(entry) == 1
+        assert re.search(r"object \d+ 0", entry[0])
+        assert [d for d in self.details(report) if "read as one stream" in d]
+
+    def test_a_page_read_through_the_fallback_counts_as_partial(
+        self, prc: ModuleType, tmp_path: Path
+    ) -> None:
+        """The two halves of this change hold each other up.
+
+        Reading the entries apart cannot prove an instruction written
+        across the join between two of them survived it, so the page is
+        not one that was read in full -- which is what stops the
+        font-subset check convicting a document on this reading.
+        """
+        path = self.build(tmp_path, b"BT /FA 12 Tf <010203> Tj ET\n", None)
+        partial: list[int] = []
+        with pikepdf.open(path) as pdf:
+            prc.extract_page_text(pdf, None, partial)
+        assert partial == [1]
+
+    def test_the_font_selected_in_one_entry_decodes_the_next(
+        self, prc: ModuleType, tmp_path: Path
+    ) -> None:
+        """The graphics state is carried across, so the text is right.
+
+        Entry 1 selects /FA and entry 2 draws with it. Reading entry 2
+        with a fresh state would draw with no font at all, and the three
+        characters would be lost rather than decoded.
+        """
+        path = self.build(tmp_path, b"BT /FA 12 Tf\n", b"<010203> Tj ET\n", None)
+        text, report = self.read(prc, path)
+        assert text == self.DRAWN
+        details = self.details(report)
+        assert [d for d in details if "before any font was selected" in d] == []
+
+    def test_the_saved_state_stack_is_carried_across_entries(
+        self, prc: ModuleType, tmp_path: Path
+    ) -> None:
+        """A q in one entry pairs with a Q in another.
+
+        Entry 1 saves /FA and selects /FB over it; entry 2 restores and
+        draws. The characters say which font was in effect: /FA spells
+        one word and /FB another, so a stack that did not cross the
+        boundary would draw the wrong three characters rather than none.
+        """
+        path = self.build(
+            tmp_path,
+            b"BT /FA 12 Tf q /FB 12 Tf\n",
+            b"Q <010203> Tj ET\n",
+            None,
+        )
+        text, _ = self.read(prc, path)
+        assert text == self.DRAWN
+        assert self.OTHER_DRAWN not in text
+
+    def test_an_instruction_written_across_a_join_is_still_one_instruction(
+        self, prc: ModuleType, tmp_path: Path
+    ) -> None:
+        """The entries are one stream, and the split is in the reading.
+
+        The division between two entries falls only at a boundary
+        between tokens (ISO 32000 section 7.8.2), so the string can be
+        in one entry and the `Tj` that draws it in the next. The
+        operands waiting for an operator carry across the join with the
+        rest of the state, which is what lets the instruction be read as
+        the one instruction it is.
+        """
+        path = self.build(tmp_path, b"BT /FA 12 Tf <010203>\n", b"Tj ET\n", None)
+        text, _ = self.read(prc, path)
+        assert text == self.DRAWN
+
+    def test_the_font_is_forgotten_across_a_join_that_would_not_read(
+        self, prc: ModuleType, tmp_path: Path
+    ) -> None:
+        """The invention this would otherwise make, in full.
+
+        Entry 1 selects /FA, entry 2 will not read, entry 3 draws
+        without selecting anything. Carrying /FA across entry 2 would
+        spell three characters out of a font this cannot show was still
+        in effect -- entry 2 may have selected another, or restored one
+        -- and put them in the page text as characters the page drew.
+        One of those can land on a mapping that really was orphaned and
+        take a genuine leak off the report.
+
+        ISO 32000 section 9.3.1 gives the font no initial value and
+        wants a Tf before any text is shown, so text a reader would draw
+        here brings its own font: forgetting costs nothing that could
+        soundly have been recovered.
+        """
+        path = self.build(tmp_path, b"BT /FA 12 Tf\n", None, b"<010203> Tj ET\n")
+        text, report = self.read(prc, path)
+        assert text == ""
+        assert self.DRAWN not in text
+        assert [d for d in self.details(report) if "before any font was selected" in d]
+
+    def test_a_font_selected_after_the_unread_entry_is_used(
+        self, prc: ModuleType, tmp_path: Path
+    ) -> None:
+        """The negative half: forgetting the state is not dropping the text.
+
+        The same three entries with the Tf moved into the last one,
+        which is where a conforming producer puts it. Nothing about the
+        entry that would not read is in the way of reading this, and it
+        has to come out as the three characters that font draws.
+        """
+        path = self.build(
+            tmp_path, b"BT /FB 12 Tf\n", None, b"/FA 12 Tf <010203> Tj ET\n"
+        )
+        text, _ = self.read(prc, path)
+        assert text == self.DRAWN
+
+    def test_the_saved_states_are_forgotten_across_that_join_too(
+        self, prc: ModuleType, tmp_path: Path
+    ) -> None:
+        """A Q cannot pair with a q on the far side of a lost entry.
+
+        Entry 1 saves the state and entry 3 restores it. What entry 2
+        did to the stack in between is not known, so the Q has nothing
+        left to restore from and is reported as one -- rather than
+        putting back a font from a depth this cannot show it is at.
+        """
+        path = self.build(
+            tmp_path, b"BT /FA 12 Tf q /FB 12 Tf\n", None, b"Q <010203> Tj ET\n"
+        )
+        text, report = self.read(prc, path)
+        assert text == ""
+        assert [d for d in self.details(report) if "had no q left to restore" in d]
+
+    def test_an_operator_whose_operands_were_lost_invents_nothing(
+        self, prc: ModuleType, tmp_path: Path
+    ) -> None:
+        """The residual risk, in the direction that matters.
+
+        The unreadable entry held the Tf, so the entry after it draws
+        with no font selected. That has to come out as bytes this could
+        not turn into characters -- never as characters decoded through
+        whatever font happened to be lying around.
+        """
+        path = self.build(tmp_path, None, b"<010203> Tj ET\n")
+        text, report = self.read(prc, path)
+        assert text == ""
+        assert [d for d in self.details(report) if "before any font was selected" in d]
+
+    def test_operands_whose_operator_was_lost_invent_nothing(
+        self, prc: ModuleType, tmp_path: Path
+    ) -> None:
+        """The other side of the same join.
+
+        Entry 1 writes the string and the unreadable entry held the Tj
+        that would have drawn it. Nothing drew, so nothing is added to
+        the page text, and the entry that could not be read is reported.
+        """
+        path = self.build(tmp_path, b"BT /FA 12 Tf <010203>\n", None)
+        text, report = self.read(prc, path)
+        assert text == ""
+        assert [d for d in self.details(report) if "entry 2" in d]
+
+    def test_a_single_stream_has_nothing_to_split(
+        self, prc: ModuleType, tmp_path: Path
+    ) -> None:
+        """The fallback is for arrays only, and says so by not running.
+
+        A page whose /Contents is one stream is reported the way it
+        always was -- there are no entries to read apart.
+        """
+        path = tmp_path / "single.pdf"
+        with pikepdf.new() as pdf:
+            page = pdf.add_blank_page()
+            stream = pdf.make_stream(b"BT /FA 12 Tf <010203> Tj ET\n")
+            stream["/Filter"] = pikepdf.Name("/FlateDecode")
+            page.obj["/Contents"] = pdf.make_indirect(stream)
+            pdf.save(path)
+        _, report = self.read(prc, path)
+        details = self.details(report)
+        assert [d for d in details if "content stream could not be parsed" in d]
+        assert [d for d in details if "read as one stream" in d] == []
+
+    def test_an_array_that_reads_as_one_stream_is_left_alone(
+        self, prc: ModuleType, tmp_path: Path
+    ) -> None:
+        """The negative half: no failure, no fallback, no warning.
+
+        The same two entries with nothing wrong with either of them.
+        Splitting the reading of an array that joined perfectly well
+        would report every such page as one this could not finish.
+        """
+        path = self.build(tmp_path, b"BT /FA 12 Tf\n", b"<010203> Tj ET\n")
+        text, report = self.read(prc, path)
+        assert text == self.DRAWN
+        assert report.findings == []
+
+    def test_the_text_read_before_the_join_failed_is_not_counted_twice(
+        self, prc: ModuleType, tmp_path: Path
+    ) -> None:
+        """The joined parse can get part way before it stops.
+
+        When it does, what it read is already in the accumulator, and
+        starting the second pass on top of it would count every
+        character and every problem twice -- so the second pass starts
+        fresh, and is a reading of the whole array from the beginning
+        rather than a continuation of the first.
+
+        The failure here is raised by this tool's own reading of a font
+        rather than by the parser, because that is the shape that stops
+        an array part way through instead of before it begins. It is
+        keyed on the font's resource name so that it falls in the same
+        place both times, the way a fault in a document does.
+        """
+        real = prc.select_font
+
+        def guarded(fonts: Any, decoders: Any, operands: Any) -> Any:
+            if any(str(o) == "/FB" for o in operands):
+                raise ValueError("this font will not read")
+            return real(fonts, decoders, operands)
+
+        path = self.build(tmp_path, b"BT /FA 12 Tf <010203> Tj ET\n", b"/FB 12 Tf\n")
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(prc, "select_font", guarded)
+            text, report = self.read(prc, path)
+        assert text == self.DRAWN
+        assert text.count("Á") == 1
+        assert len([d for d in self.details(report) if "entry 2" in d]) == 1
+
+    def test_an_entry_that_is_not_a_stream_is_reported_once(
+        self, prc: ModuleType, tmp_path: Path
+    ) -> None:
+        """An array can hold anything, and the fallback skips what it holds.
+
+        A number in the array is already reported as an entry that is
+        not a content stream. Handing it to the parser as well would say
+        the same thing twice, in two different words.
+        """
+        path = self.build(tmp_path, b"BT /FA 12 Tf <010203> Tj ET\n", None)
+        with pikepdf.open(path, allow_overwriting_input=True) as pdf:
+            contents = pdf.pages[0].obj["/Contents"]
+            pdf.pages[0].obj["/Contents"] = pikepdf.Array([*contents, 42])
+            pdf.save(path)
+        text, report = self.read(prc, path)
+        assert text == self.DRAWN
+        not_a_stream = [d for d in self.details(report) if "entry 3" in d]
+        assert len(not_a_stream) == 1
+        assert "is not a content stream" in not_a_stream[0]
+
+
 # One line of drawing instructions, for the pages that are meant to be
 # readable. /F1 is the font the page in `TestDrawingInstructionsThatAreNot`
 # defines.
@@ -721,13 +1076,19 @@ class TestDrawingInstructionsThatAreNot:
     def test_a_bad_array_entry_is_still_named_when_the_rest_will_not_parse(
         self, prc: ModuleType, tmp_path: Path
     ) -> None:
-        """Two things went unread, and the report has to say both.
+        """Three things went unread, and the report has to say all three.
 
         The array holds a stream that says it is compressed and is not,
         which costs the page its text, and a number, which the parser
         passes over. Reading what /Contents is has to survive reading
         what it draws, or the second observation goes down with the
         first.
+
+        The stream is the only entry there is anything in, so reading
+        the entries apart -- which is what follows an array that will
+        not read as one -- recovers nothing here; that it was tried, and
+        that the one entry it could have recovered would not read on its
+        own either, are the other two.
         """
 
         def build(pdf: pikepdf.Pdf) -> Any:
@@ -738,9 +1099,10 @@ class TestDrawingInstructionsThatAreNot:
         text, report = self.read(prc, tmp_path, build)
         assert text == ""
         details = [f.detail for f in report.findings]
-        assert len(details) == 2
+        assert len(details) == 3
         assert [d for d in details if "entry 2 of the page's drawing" in d]
-        assert [d for d in details if "could not be parsed" in d]
+        assert [d for d in details if "read as one stream they stopped" in d]
+        assert [d for d in details if "could not be read on its own either" in d]
 
     def test_an_array_entry_that_is_not_a_stream(
         self, prc: ModuleType, tmp_path: Path

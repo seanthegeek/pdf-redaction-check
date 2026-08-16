@@ -1789,6 +1789,41 @@ class ContentReader(StreamParser):
         else:
             self.unrestored += 1
 
+    def forget_state(self) -> None:
+        """Drop the graphics state, for a join this could not read across.
+
+        Only `draw_page_entries` calls this, and only for an entry of a
+        /Contents array that would not read. Everything this holds
+        describes a state that the unread entry may have changed: the
+        font in effect, because that entry may have selected another
+        one; the saved states, because it may have saved or restored;
+        and the operands still waiting for an operator, because the
+        operator that would have used them was in it.
+
+        Carrying any of that past the entry would read the text after it
+        through a state this cannot know the document was in -- which
+        puts characters into the page text that the page may never have
+        drawn, and a character invented here can land on a font mapping
+        that really was orphaned and hide a leak. ISO 32000 section
+        9.3.1 gives the font no initial value and requires a Tf before
+        any text is shown, so text after the unread entry that a reader
+        would draw at all brings its own font with it; what is forgotten
+        here costs the reading nothing it could soundly have recovered.
+
+        The counts stay where they are. What was already dropped or left
+        unrestored is still something that happened, and the entry that
+        would not read is reported by object in its own right, so
+        nothing goes unsaid by forgetting the state it left behind.
+        """
+        self.font = NO_FONT
+        self.saved.clear()
+        # Cleared with the stack it counts against: a `q` whose state
+        # went unkept pairs with a later `Q`, and past this point there
+        # is no telling which `Q` that is. A `Q` after this has nothing
+        # left to restore from, and is reported as one.
+        self.unkept = 0
+        self.operands.clear()
+
     def show_text(self, operands: list[pikepdf.Object]) -> None:
         """Read what one show-text instruction draws, through its font."""
         font = self.font
@@ -1993,6 +2028,112 @@ def content_problems(page: pikepdf.Page) -> list[str]:
     ]
 
 
+def content_entries(page: pikepdf.Page) -> list[pikepdf.Object] | None:
+    """Return the entries of a page's /Contents array, or None.
+
+    None is a page whose /Contents is a single content stream, is
+    missing, or is something else entirely -- none of which is an array
+    with entries to read apart. The entries are returned as they stand,
+    whatever they are, so that the position of one in the list is the
+    position a reader would count it at; `content_problems` reports the
+    ones that are not content streams.
+    """
+    contents = page.get("/Contents")
+    if not isinstance(contents, pikepdf.Array):
+        return None
+    return list(contents)
+
+
+def joined_parse_note(entries: int, exc: Exception) -> str:
+    """Describe an array of content streams that would not read as one.
+
+    `entries` is how many the array holds, counting the ones that are
+    not content streams, so that the number agrees with the positions
+    the entries are reported by. `exc` is what the joined parse stopped
+    on.
+
+    It says what was tried, what stopped, what was done instead, and
+    what that leaves unknown, because the second attempt recovers text
+    the first lost and an operator has no other way to tell which
+    reading the page text in front of them came from.
+    """
+    return (
+        f"the page's drawing instructions (/Contents) are {entries} content "
+        "stream(s) in an array, which a reader joins into one before parsing, "
+        f"and read as one stream they stopped: {exc}; each entry was read on "
+        "its own instead, carrying the font in effect and the saved graphics "
+        "states across every join that could be read across, so what the "
+        "entries that could be read draw was inspected -- but an instruction "
+        "written across a join beside an entry that could not be read is "
+        "split between the two, and the state such an entry would have left "
+        "behind is not known, so from there on the text was read as text "
+        "drawn with no font selected rather than guessed at"
+    )
+
+
+def draw_page_entries(
+    page: pikepdf.Page,
+    entries: list[pikepdf.Object],
+    scopes: tuple[pikepdf.Object | None, ...],
+    found: PageText,
+) -> list[str]:
+    """Read a page's drawing instructions one array entry at a time.
+
+    ISO 32000 section 7.8.2 makes an array of content streams one
+    stream, divided only at the boundaries between tokens, so a reader
+    joins them before parsing and so does the parser underneath this.
+    Joining them is also what makes one unreadable entry cost the text
+    of every other: the parse of the joined stream hands over no objects
+    at all. This is what reads the rest of them, and it runs only after
+    that joined parse has already failed.
+
+    One reader takes every entry, which is what carries the graphics
+    state across the joins it can read across: the font in effect, the
+    stack of saved states that `q` and `Q` work on, and the operands
+    still waiting for an operator. Reading each entry with a state of
+    its own would decode the text after a join through the wrong font,
+    putting characters into the page text that the page never drew --
+    and a character invented here can land on a mapping that really was
+    orphaned and hide a leak, which is worse than losing the text
+    outright. The entries are one stream; only the reading of them is
+    split.
+
+    A join this could not read across is the other half of the same
+    rule: an entry that would not read may have changed any of that
+    state, so it is forgotten rather than carried past, which is what
+    `forget_state` is for.
+
+    Returns a description of each entry that could not be read on its
+    own either. An entry that is not a content stream is passed over
+    rather than handed to the parser: `content_problems` reports those,
+    and reporting them here as well would say the same thing twice.
+    """
+    reader = ContentReader(page, scopes, found, NO_FONT, 0)
+    failures: list[str] = []
+    try:
+        for position, entry in enumerate(entries, start=1):
+            if not isinstance(entry, pikepdf.Stream):
+                continue
+            try:
+                pikepdf.Object._parse_stream(entry, reader)
+            except UNPARSABLE_CONTENT as exc:
+                failures.append(
+                    f"entry {position} of the page's drawing instructions "
+                    f"(/Contents), {object_label(entry)}, could not be read on "
+                    "its own either, so the text it draws from the point it "
+                    "stopped at was not inspected, and the state it would have "
+                    "left the following entries in is not known: "
+                    f"{exc}"
+                )
+                reader.forget_state()
+    finally:
+        # The same bargain `draw_content` makes: what the reader counted
+        # before anything went wrong is still worth saying, and the
+        # counts live on the reader rather than in `found`.
+        reader.note_problems()
+    return failures
+
+
 def _page_text(page: pikepdf.Page) -> tuple[str, list[str], list[str]]:
     """Decode the text one page draws, through the fonts it draws it with.
 
@@ -2018,20 +2159,38 @@ def _page_text(page: pikepdf.Page) -> tuple[str, list[str], list[str]]:
     among the problems: the same bargain `draw_form` makes for a form
     that stops part way through.
 
+    A page whose /Contents is an array gets a second attempt. The
+    entries of one are joined into a single stream before parsing, as a
+    reader joins them, so one entry that will not decode costs the text
+    of every other -- and that text is on the page in front of the
+    operator. When the joined parse stops, the entries are read one at a
+    time instead; see `draw_page_entries`. The second pass starts on a
+    fresh accumulator, because it is a reading of the whole array from
+    the beginning rather than a continuation of the first, and adding it
+    to what the first pass had already read would count that text and
+    those problems twice.
+
     A /Contents entry that is not drawing instructions is not described
     here: that is a reading of the entry rather than of the instructions
     in it, and the caller makes it; see `content_problems`.
     """
     found = PageText()
     problems: list[str] = []
+    scopes = (page_resources(page),)
     try:
-        draw_content(page, (page_resources(page),), found)
+        draw_content(page, scopes, found)
     except UNPARSABLE_CONTENT as exc:
-        problems.append(
-            "the page content stream could not be parsed all the way "
-            "through, so the text it draws from the point it stopped at was "
-            f"not inspected: {exc}"
-        )
+        entries = content_entries(page)
+        if entries is None:
+            problems.append(
+                "the page content stream could not be parsed all the way "
+                "through, so the text it draws from the point it stopped at was "
+                f"not inspected: {exc}"
+            )
+        else:
+            problems.append(joined_parse_note(len(entries), exc))
+            found = PageText()
+            problems += draw_page_entries(page, entries, scopes, found)
 
     problems += [
         undecoded_note(name, count) for name, count in found.unresolved.items()

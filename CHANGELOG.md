@@ -25,6 +25,30 @@ bump.
 
 ### Fixed
 
+- A page whose drawing instructions are an array of content streams no longer
+  loses the text of every entry when one of them will not decode. ISO 32000
+  section 7.8.2 makes such an array one stream, divided only at the boundaries
+  between tokens, so a reader joins the entries before parsing and so does the
+  parser underneath this — and a joined parse that meets an entry it cannot
+  decode hands over no instructions at all, not even for the entries before it.
+  A page still drawing that text then had nothing to account for the characters
+  its fonts declare, which is the shape of a false failed-redaction verdict.
+  The joined read is still tried first, because that is what a reader does; when
+  it stops, the entries are now read one at a time, and each one that would not
+  read is named by its object. The font in effect and the stack of saved
+  graphics states carry across every join that could be read across, because
+  reading each entry with a state of its own would decode the text after a join
+  through the wrong font — putting characters into the page text that the page
+  never drew, which can land on a mapping that really was orphaned and hide a
+  genuine leak. They are forgotten at a join that could not be read across, for
+  the same reason in the other direction: an entry that would not read may have
+  selected another font or restored the graphics state, so from there on the
+  text reads as text drawn with no font selected rather than through a font
+  this cannot show was still in effect. An instruction written across such a
+  join draws nothing rather than drawing the wrong characters. Both show up
+  among the counts of text this could not turn into characters. A page read
+  this way counts as one that was not read in full, so the bullet above applies
+  to its fonts.
 - A font's leftover character mappings are no longer reported as a removed
   passage when the page text they were compared against could not be read in
   full. The font-subset check reads a character it cannot account for in the
