@@ -63,12 +63,20 @@ class TestExitCodes:
             ("form_xobject.pdf", 1),
             # Fonts this cannot read all the way, and one orphan.
             ("broken_fonts.pdf", 1),
+            # Structures nested deeper than any walk here follows. The
+            # address is in the file and out of reach, so the run must
+            # report what it could not read rather than nothing at all.
+            ("deep_nesting.pdf", 1),
             # A stream that will not decompress: a layer of this
             # document nothing here could read, on a run given no
             # secret to look for.
             ("cleartext_stream.pdf", 1),
             ("unapplied.pdf", 2),
             ("orphan_font.pdf", 2),
+            # The font a q saved and a Q put back: the leftovers the
+            # page really carries, once its text is read through the
+            # font a reader would have in effect.
+            ("saved_state.pdf", 2),
         ],
     )
     def test_structural_run(
@@ -153,6 +161,40 @@ class TestSecretSources:
         assert (
             prc.main([str(fixtures / "clean.pdf"), "--secret-file", str(listing)]) == 0
         )
+
+    @pytest.mark.parametrize("blank", ["", " ", "\t", "\n", "   \t "])
+    def test_a_blank_secret_is_a_usage_error(
+        self,
+        prc: ModuleType,
+        fixtures: Path,
+        blank: str,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """A blank secret is in every document, so it convicts every one.
+
+        The shape this arrives in is a CI gate running `--secret
+        "$NAME"` with the variable unset. Matching it would report a
+        clean document as a failed redaction; dropping it silently would
+        report an unchecked document as a clean one. Neither is an
+        answer, so the invocation is refused.
+        """
+        code = prc.main([str(fixtures / "clean.pdf"), "--secret", blank])
+        assert code == prc.EXIT_USAGE
+        assert "--secret" in capsys.readouterr().err
+
+    def test_a_blank_secret_is_refused_beside_a_real_one(
+        self, prc: ModuleType, fixtures: Path
+    ) -> None:
+        """One good secret does not make the blank one harmless: it would
+        still match, and every document would still fail."""
+        code = prc.main([str(fixtures / "fake_redacted.pdf"), "-s", SECRET, "-s", ""])
+        assert code == prc.EXIT_USAGE
+
+    def test_a_secret_of_ordinary_text_is_not_refused(
+        self, prc: ModuleType, fixtures: Path
+    ) -> None:
+        """The negative half: only a secret with nothing in it is."""
+        assert prc.main([str(fixtures / "clean.pdf"), "-s", SECRET]) == 0
 
     def test_missing_secret_file_is_a_usage_error(
         self,

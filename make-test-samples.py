@@ -43,6 +43,8 @@ and safe to paste into a bug report.
     smart_quotes.pdf     WinAnsi curly quotes, and nothing hidden
     broken_fonts.pdf     font dictionaries that cannot be read
     form_xobject.pdf     page text drawn inside a Form XObject
+    saved_state.pdf      the font a q saved and a Q put back
+    deep_nesting.pdf     structures nested deeper than any walk follows
 
 Most of these render identically -- a leak that showed on screen would
 not be a leak -- so each page carries a caption naming itself and what
@@ -125,6 +127,8 @@ CAPTIONS = {
     "smart_quotes.pdf": "Sample smart_quotes.pdf - curly quotes, nothing hidden",
     "broken_fonts.pdf": "Sample broken_fonts.pdf - font dictionaries that misbehave",
     "form_xobject.pdf": "Sample form_xobject.pdf - text drawn inside a Form XObject",
+    "saved_state.pdf": "Sample saved_state.pdf - a Q puts back the font a q saved",
+    "deep_nesting.pdf": "Sample deep_nesting.pdf - nested deeper than a walk follows",
 }
 
 # The character codes the Form XObject sample draws, in WinAnsiEncoding.
@@ -134,6 +138,29 @@ CAPTIONS = {
 # dieresis marks, and 0xB5 and 0xB6 are the micro and pilcrow signs.
 OUTER_FORM_CODES = bytes(range(0xA5, 0xA9))
 INNER_FORM_CODES = bytes(range(0xB5, 0xB7))
+
+# The two fonts of the saved-state sample, as the standard PostScript
+# glyph names a producer writes. Neither set of characters appears
+# anywhere else on the page, so every one of them that shows up in the
+# recovered text got there through the font named here.
+#
+# /FKept draws all three of its characters, after a Q has put it back in
+# effect. /FDropped draws only the first of its four, so its other three
+# are genuine leftovers -- and they are exactly the characters the codes
+# drawn after the Q would spell if they were read through /FDropped,
+# which is what makes the leftovers disappear when the Q is ignored.
+KEPT_GLYPH_NAMES = ("Aacute", "Eacute", "Iacute")
+DROPPED_GLYPH_NAMES = ("Ograve", "Ugrave", "Ydieresis", "Zcaron")
+
+# How deep the deep-nesting sample nests, against a tool that follows 64
+# levels. Deeper than the limit by enough that an off-by-one in either
+# place cannot be what the sample is testing.
+NESTING_DEPTH = 70
+
+# The codes the innermost form of that sample draws, in WinAnsiEncoding:
+# 0xBC to 0xBE are the three vulgar fractions. Nothing reaches them,
+# which is the point of the sample.
+DEEP_FORM_CODES = bytes(range(0xBC, 0xBF))
 
 
 def unique_chars(text: str) -> list[str]:
@@ -764,10 +791,17 @@ def build_smart_quotes() -> None:
 def build_broken_fonts() -> None:
     """A page whose font dictionaries cannot be read all the way.
 
-    Three ways that happens, none of which may end in a crash or in a
+    Five ways that happens, none of which may end in a crash or in a
     silent "nothing declared": a composite font listed as its own
-    descendant, a /Widths array with a name where a number belongs, and
-    a /FirstChar that is not a number at all.
+    descendant, a /Widths array with a name where a number belongs, a
+    /FirstChar that is not a number at all, a /Font resource that is a
+    number rather than a font dictionary, and a /ToUnicode entry that is
+    a number rather than the stream a character map lives in.
+
+    The last two matter because pikepdf hands a number back as a plain
+    Python int, which has none of the methods a font is read with, so
+    reading one used to end the whole run in a traceback -- and a run
+    that ended there reported no findings at all.
     """
     name = "broken_fonts.pdf"
     letter_pdf(name, CAPTIONS[name], include_secret=False)
@@ -809,6 +843,28 @@ def build_broken_fonts() -> None:
                 Widths=[500],
             )
         )
+
+        # A /Font group entry that is not a font at all, and a font
+        # whose /ToUnicode is not the stream a character map lives in.
+        fonts["/FScalar"] = 42
+        fonts["/FScalarCMap"] = pdf.make_indirect(
+            pikepdf.Dictionary(
+                Type=pikepdf.Name("/Font"),
+                Subtype=pikepdf.Name("/Type1"),
+                BaseFont=pikepdf.Name("/Helvetica"),
+                ToUnicode=42,
+            )
+        )
+
+        # Both of those are drawn with, because the page text is read
+        # through the font in effect: a font that cannot be read has to
+        # cost the text it drew and nothing more. The codes are X and Y,
+        # which are on no other font's list here -- drawing an A or a C
+        # would put a character /FBadWidth declares onto the page and
+        # quietly cost this sample its one-orphan case.
+        page = pdf.pages[0]
+        page.contents_add(pdf.make_stream(show_text("FScalar", b"XY", 580)))
+        page.contents_add(pdf.make_stream(show_text("FScalarCMap", b"XY", 560)))
         pdf.save(SAMPLES / name)
 
 
@@ -889,6 +945,126 @@ def build_form_xobject() -> None:
         pdf.save(SAMPLES / name)
 
 
+def differences_font(names: tuple[str, ...]) -> pikepdf.Dictionary:
+    """Return a font whose /Differences maps code 1 upwards to `names`.
+
+    The codes themselves mean nothing without the array: 1, 2 and 3 are
+    control codes in every base encoding, so whatever these characters
+    turn out to be, the /Differences array of the font in effect is what
+    decided it.
+    """
+    return pikepdf.Dictionary(
+        Type=pikepdf.Name("/Font"),
+        Subtype=pikepdf.Name("/Type1"),
+        BaseFont=pikepdf.Name("/Helvetica"),
+        Encoding=pikepdf.Dictionary(
+            Type=pikepdf.Name("/Encoding"),
+            Differences=[1, *(pikepdf.Name(f"/{name}") for name in names)],
+        ),
+    )
+
+
+def build_saved_state() -> None:
+    """A page that draws text with the font a Q put back in effect.
+
+    The font is part of the graphics state that `q` saves and `Q`
+    restores (ISO 32000 section 8.4.2), and a producer wraps a block of
+    drawing in the pair as a matter of course. The page selects /FKept,
+    draws one character inside a q ... Q pair through /FDropped, and
+    then draws three more codes with no /Tf of its own -- so what those
+    codes spell is decided by the font the Q put back.
+
+    Reading the page as though the Q had not happened gets both fonts
+    wrong at once. The three codes come out as three of the four
+    characters /FDropped declares, which hides the leftovers that font
+    really does carry; and the three characters /FKept declares are then
+    nowhere in the recovered text, so a font that drew everything it
+    declares is reported as the remnant of a removed passage.
+    """
+    name = "saved_state.pdf"
+    letter_pdf(name, CAPTIONS[name], include_secret=False)
+    with pikepdf.open(SAMPLES / name, allow_overwriting_input=True) as pdf:
+        fonts = pdf.pages[0]["/Resources"]["/Font"]
+        fonts["/FKept"] = pdf.make_indirect(differences_font(KEPT_GLYPH_NAMES))
+        fonts["/FDropped"] = pdf.make_indirect(differences_font(DROPPED_GLYPH_NAMES))
+        # `0 g` restores black, which the grey caption left set. /Tf is a
+        # text-state operator and is legal outside a text object, which
+        # is where a producer puts it when several text objects share a
+        # font.
+        pdf.pages[0].contents_add(
+            pdf.make_stream(
+                b"0 g /FKept 12 Tf\n"
+                b"q /FDropped 12 Tf BT 72 580 Td <01> Tj ET Q\n"
+                b"BT 72 560 Td <010203> Tj ET\n"
+            )
+        )
+        pdf.save(SAMPLES / name)
+
+
+def build_deep_nesting() -> None:
+    """A document nested deeper than any walk here follows.
+
+    Every walk of the object graph stops at a fixed depth, because a
+    hostile file can nest structures as deeply as it likes and a walk
+    that followed them would never finish. Stopping is not the problem;
+    stopping quietly is. This sample is what proves each walk says where
+    it gave up, rather than reporting the part it managed to read as the
+    whole of the document.
+
+    Two nests, for the two shapes that matters in. The tag tree carries
+    the address at the bottom of a chain of /K entries, so a walk that
+    stopped without saying so would report a tagged document as carrying
+    no structure text at all. The page draws a Form XObject that draws a
+    Form XObject, and so on down to one that draws text through a font
+    of its own -- so the same silence would cost the text that form
+    draws, and then report the characters that font declares as the
+    remnant of a passage that was removed.
+    """
+    name = "deep_nesting.pdf"
+    letter_pdf(name, CAPTIONS[name], include_secret=False)
+    with pikepdf.open(SAMPLES / name, allow_overwriting_input=True) as pdf:
+        node = pdf.make_indirect(
+            pikepdf.Dictionary(
+                Type=pikepdf.Name("/StructElem"),
+                S=pikepdf.Name("/Span"),
+                ActualText=pikepdf.String(SECRET),
+            )
+        )
+        for _ in range(NESTING_DEPTH):
+            node = pdf.make_indirect(
+                pikepdf.Dictionary(
+                    Type=pikepdf.Name("/StructElem"),
+                    S=pikepdf.Name("/Span"),
+                    K=node,
+                )
+            )
+        pdf.Root["/StructTreeRoot"] = pdf.make_indirect(
+            pikepdf.Dictionary(Type=pikepdf.Name("/StructTreeRoot"), K=node)
+        )
+        pdf.Root["/MarkInfo"] = pikepdf.Dictionary(Marked=True)
+
+        nested = form(
+            pdf,
+            show_text("FDeep", DEEP_FORM_CODES, 580),
+            pikepdf.Dictionary(
+                Font=pikepdf.Dictionary(
+                    FDeep=pdf.make_indirect(
+                        widths_font(DEEP_FORM_CODES[0], len(DEEP_FORM_CODES))
+                    )
+                )
+            ),
+        )
+        for _ in range(NESTING_DEPTH):
+            nested = form(
+                pdf,
+                b"q /Fm Do Q\n",
+                pikepdf.Dictionary(XObject=pikepdf.Dictionary(Fm=nested)),
+            )
+        pdf.pages[0]["/Resources"]["/XObject"] = pikepdf.Dictionary(Fm0=nested)
+        pdf.pages[0].contents_add(pdf.make_stream(b"q /Fm0 Do Q\n"))
+        pdf.save(SAMPLES / name)
+
+
 def main() -> None:
     """Rewrite every fixture in tests/samples."""
     SAMPLES.mkdir(parents=True, exist_ok=True)
@@ -916,6 +1092,8 @@ def main() -> None:
     build_smart_quotes()
     build_broken_fonts()
     build_form_xobject()
+    build_saved_state()
+    build_deep_nesting()
     print(f"wrote {len(CAPTIONS)} sample PDFs to {SAMPLES}")
 
 

@@ -274,6 +274,24 @@ class TestFormXObjects:
             stream["/Resources"] = resources
         return pdf.make_indirect(stream)
 
+    def swapped(self, pdf: pikepdf.Pdf, letter: str) -> pikepdf.Object:
+        """Return a font drawing code 1 as the given letter.
+
+        Code 1 is a control code in every base encoding, so what it
+        draws is decided entirely by the font resolved for it.
+        """
+        return pdf.make_indirect(
+            pikepdf.Dictionary(
+                Type=pikepdf.Name("/Font"),
+                Subtype=pikepdf.Name("/Type1"),
+                BaseFont=pikepdf.Name("/Helvetica"),
+                Encoding=pikepdf.Dictionary(
+                    Type=pikepdf.Name("/Encoding"),
+                    Differences=[1, pikepdf.Name(f"/{letter}")],
+                ),
+            )
+        )
+
     def read(
         self,
         prc: ModuleType,
@@ -407,6 +425,43 @@ class TestFormXObjects:
         assert text == "ABxy"
         assert report.findings == []
 
+    def test_two_forms_sharing_one_resource_dictionary_are_both_read(
+        self, prc: ModuleType
+    ) -> None:
+        """A drawing is not told apart by its innermost resources alone.
+
+        Two forms here share one /Resources dictionary, and each draws
+        the same third form. What that third form draws differs all the
+        same, because the two are drawn from different places and the
+        outer resources are what define the font it names: through /A
+        it is an x, and through /C it is a z. Recording a drawing by its
+        innermost resources makes the two look like one, and the second
+        z never reaches the page text -- where a font declaring it is
+        then reported as the remnant of a removed passage.
+        """
+        with pikepdf.new() as pdf:
+            page = pdf.add_blank_page()
+            inner = self.form(pdf, b"BT /FInner 12 Tf <01> Tj ET", pikepdf.Dictionary())
+            shared = pdf.make_indirect(
+                pikepdf.Dictionary(XObject=pikepdf.Dictionary(Fm=inner))
+            )
+            through_c = pikepdf.Dictionary(
+                XObject=pikepdf.Dictionary(B=self.form(pdf, b"/Fm Do", shared)),
+                Font=pikepdf.Dictionary(FInner=self.swapped(pdf, "z")),
+            )
+            page.Resources = pikepdf.Dictionary(
+                Font=pikepdf.Dictionary(FInner=self.swapped(pdf, "x")),
+                XObject=pikepdf.Dictionary(
+                    A=self.form(pdf, b"/Fm Do", shared),
+                    C=self.form(pdf, b"/B Do", through_c),
+                ),
+            )
+            page.Contents = pdf.make_stream(b"q /A Do Q q /C Do Q")
+            report = prc.Report(path=Path("x.pdf"))
+            text = prc.extract_page_text(pdf, report)
+        assert text == "xz"
+        assert report.findings == []
+
     def test_a_form_that_will_not_parse_costs_only_its_own_text(
         self, prc: ModuleType
     ) -> None:
@@ -516,18 +571,221 @@ class TestFormXObjects:
         """
         drawn: set[tuple[object, ...]] = set()
         direct = pikepdf.Dictionary()
-        assert prc.already_drawn(direct, "/F1", None, drawn) is False
-        assert prc.already_drawn(direct, "/F1", None, drawn) is False
+        page = pikepdf.Dictionary()
+        assert prc.already_drawn(direct, "/F1", page, None, drawn) is False
+        assert prc.already_drawn(direct, "/F1", page, None, drawn) is False
         assert drawn == set()
 
-    def test_the_depth_limit_stops_the_walk(self, prc: ModuleType) -> None:
-        """Forms nest, so the walk is bounded as the tag tree walk is."""
+    def test_the_depth_limit_stops_the_walk_and_says_where(
+        self, prc: ModuleType
+    ) -> None:
+        """Forms nest, so the walk is bounded as the tag tree walk is.
+
+        The text this stream draws is lost when it stops, and lost page
+        text is what the font-subset check compares fonts against, so
+        stopping has to be said out loud and has to name the stream.
+        """
         with pikepdf.new() as pdf:
             page = pdf.add_blank_page()
             page.Contents = pdf.make_stream(b"BT /F1 12 Tf (deep) Tj ET")
             found = prc.PageText()
             prc.draw_content(page, (prc.page_resources(page),), found, depth=65)
+            expected = prc.object_label(page)
         assert found.out == []
+        assert len(found.problems) == 1
+        assert "more than 64 levels deep" in found.problems[0]
+        assert expected in found.problems[0]
+
+    def test_a_walk_within_the_limit_says_nothing(self, prc: ModuleType) -> None:
+        """The negative half: an ordinary page reports no such problem."""
+        with pikepdf.new() as pdf:
+            page = pdf.add_blank_page()
+            page.Contents = pdf.make_stream(b"BT /F1 12 Tf (shallow) Tj ET")
+            found = prc.PageText()
+            prc.draw_content(page, (prc.page_resources(page),), found)
+        assert found.problems == []
+
+
+class TestSavedGraphicsState:
+    """`q` saves the font in effect and `Q` puts it back.
+
+    The font is part of the graphics state that those two operators save
+    and restore (ISO 32000 section 8.4.2), and ordinary producers wrap
+    blocks of drawing in the pair. Reading a page as though they did
+    nothing decodes the text after a `Q` through whichever font was
+    selected inside the pair, which invents characters the page never
+    drew and loses the ones it did.
+    """
+
+    def swapping_font(self, pdf: pikepdf.Pdf, names: str) -> pikepdf.Object:
+        """Return a font mapping code 1 upwards to the given letters.
+
+        Codes 1 and 2 are control codes in every base encoding, so what
+        they spell is decided entirely by the /Differences array of the
+        font in effect where they are drawn.
+        """
+        return pdf.make_indirect(
+            pikepdf.Dictionary(
+                Type=pikepdf.Name("/Font"),
+                Subtype=pikepdf.Name("/Type1"),
+                BaseFont=pikepdf.Name("/Helvetica"),
+                Encoding=pikepdf.Dictionary(
+                    Type=pikepdf.Name("/Encoding"),
+                    Differences=[1, *(pikepdf.Name(f"/{name}") for name in names)],
+                ),
+            )
+        )
+
+    def read(
+        self,
+        prc: ModuleType,
+        pdf: pikepdf.Pdf,
+        contents: bytes,
+        xobjects: pikepdf.Object | None = None,
+    ) -> tuple[str, Any]:
+        """Read one page drawing `contents` with two swapping fonts."""
+        page = pdf.add_blank_page()
+        resources = pikepdf.Dictionary(
+            Font=pikepdf.Dictionary(
+                F1=self.swapping_font(pdf, "AB"),
+                F2=self.swapping_font(pdf, "zy"),
+            )
+        )
+        if xobjects is not None:
+            resources["/XObject"] = xobjects
+        page.Resources = resources
+        page.Contents = pdf.make_stream(contents)
+        report = prc.Report(path=Path("x.pdf"))
+        return prc.extract_page_text(pdf, report), report
+
+    def form(self, pdf: pikepdf.Pdf, body: bytes) -> pikepdf.Object:
+        """Return a Form XObject drawing `body` with the page's fonts."""
+        stream = pdf.make_stream(body)
+        stream["/Type"] = pikepdf.Name("/XObject")
+        stream["/Subtype"] = pikepdf.Name("/Form")
+        stream["/BBox"] = [0, 0, 200, 200]
+        return pdf.make_indirect(stream)
+
+    def test_the_font_a_q_saved_is_in_effect_after_the_Q(self, prc: ModuleType) -> None:
+        """The whole of the defect, in one page.
+
+        Three runs of the same two codes: through /F1, through the /F2
+        the pair selects, and through the /F1 the `Q` puts back.
+        """
+        with pikepdf.new() as pdf:
+            text, report = self.read(
+                prc,
+                pdf,
+                b"/F1 12 Tf BT <0102> Tj ET\n"
+                b"q /F2 12 Tf BT <0102> Tj ET Q\n"
+                b"BT <0102> Tj ET\n",
+            )
+        assert text == "ABzyAB"
+        assert report.findings == []
+
+    def test_saves_are_restored_in_the_order_they_were_made(
+        self, prc: ModuleType
+    ) -> None:
+        """A stack, not a single remembered font."""
+        with pikepdf.new() as pdf:
+            text, _ = self.read(
+                prc,
+                pdf,
+                b"/F1 12 Tf q /F2 12 Tf q /F1 12 Tf BT <01> Tj ET\n"
+                b"Q BT <01> Tj ET Q BT <01> Tj ET\n",
+            )
+        assert text == "AzA"
+
+    def test_a_restore_with_nothing_saved_leaves_the_font_alone(
+        self, prc: ModuleType
+    ) -> None:
+        """A `Q` that restores nothing is malformed, and is reported.
+
+        Readers ignore it, and so does this -- but quietly ignoring it
+        would leave the operator no way to know that the font this read
+        the rest of the page through is a guess.
+        """
+        with pikepdf.new() as pdf:
+            text, report = self.read(prc, pdf, b"/F2 12 Tf Q BT <0102> Tj ET\n")
+        assert text == "zy"
+        assert [f.check for f in report.findings] == [prc.CONTENT_STREAM]
+        assert report.findings[0].severity is prc.Severity.WARNING
+        assert "1 Q operator(s)" in report.findings[0].detail
+
+    def test_a_balanced_page_reports_no_restore_problem(self, prc: ModuleType) -> None:
+        """The negative half of the claim above."""
+        with pikepdf.new() as pdf:
+            _, report = self.read(prc, pdf, b"q /F2 12 Tf BT <01> Tj ET Q\n")
+        assert report.findings == []
+
+    def test_a_pair_split_across_two_content_streams_still_matches(
+        self, prc: ModuleType
+    ) -> None:
+        """A page's content streams are one stream between them.
+
+        ISO 32000 section 7.8.2 has a page's /Contents array read as a
+        single stream, so a `q` written in one and its `Q` in the next
+        are a pair -- which is how a producer that appends to a page
+        writes them.
+        """
+        with pikepdf.new() as pdf:
+            page = pdf.add_blank_page()
+            page.Resources = pikepdf.Dictionary(
+                Font=pikepdf.Dictionary(
+                    F1=self.swapping_font(pdf, "AB"),
+                    F2=self.swapping_font(pdf, "zy"),
+                )
+            )
+            page.Contents = pdf.make_stream(b"/F1 12 Tf q /F2 12 Tf BT <01> Tj ET")
+            page.contents_add(pdf.make_stream(b"Q BT <01> Tj ET"))
+            report = prc.Report(path=Path("x.pdf"))
+            text = prc.extract_page_text(pdf, report)
+        assert text == "zA"
+        assert report.findings == []
+
+    def test_a_form_cannot_restore_the_state_of_whatever_drew_it(
+        self, prc: ModuleType
+    ) -> None:
+        """A form's content runs inside a save of its own.
+
+        The page saves /F1 and selects /F2 before drawing the form. The
+        form's own `Q` has nothing of the form's to restore, so it
+        leaves /F2 in effect there; the page's `Q` is the one that puts
+        /F1 back.
+        """
+        with pikepdf.new() as pdf:
+            xobjects = pikepdf.Dictionary(Fm0=self.form(pdf, b"Q BT <0102> Tj ET"))
+            text, report = self.read(
+                prc,
+                pdf,
+                b"/F1 12 Tf q /F2 12 Tf /Fm0 Do Q BT <0102> Tj ET\n",
+                xobjects,
+            )
+        assert text == "zyAB"
+        assert [f.check for f in report.findings] == [prc.CONTENT_STREAM]
+        assert "1 Q operator(s)" in report.findings[0].detail
+
+    def test_a_save_a_form_leaves_open_does_not_outlive_it(
+        self, prc: ModuleType
+    ) -> None:
+        """The other direction: the form's stack goes away with it.
+
+        The form saves the state and never restores it. Back on the
+        page, the font is the one the page selected, and the page's own
+        `Q` still has the page's save to restore.
+        """
+        with pikepdf.new() as pdf:
+            xobjects = pikepdf.Dictionary(
+                Fm0=self.form(pdf, b"q /F2 12 Tf BT <0102> Tj ET")
+            )
+            text, report = self.read(
+                prc,
+                pdf,
+                b"/F1 12 Tf q /Fm0 Do BT <0102> Tj ET Q BT <0102> Tj ET\n",
+                xobjects,
+            )
+        assert text == "zyABAB"
+        assert report.findings == []
 
 
 class TestResourceGroups:
@@ -649,6 +907,28 @@ class TestStructureTree:
     def test_depth_limit_stops_traversal(self, prc: ModuleType) -> None:
         node = pikepdf.Dictionary(ActualText=pikepdf.String("deep"))
         assert list(prc.walk_struct(node, set(), depth=65)) == []
+
+    def test_the_depth_limit_records_where_it_stopped(self, prc: ModuleType) -> None:
+        """Stopping is the defense; stopping quietly is the bug.
+
+        The text below the limit is not read, so the only thing that
+        keeps the tags above it from reading as the whole of the tree is
+        this list of the places the walk gave up at.
+        """
+        with pikepdf.new() as pdf:
+            node = pdf.make_indirect(
+                pikepdf.Dictionary(ActualText=pikepdf.String("deep"))
+            )
+            stops: list[str] = []
+            assert list(prc.walk_struct(node, set(), depth=65, stops=stops)) == []
+            assert stops == [prc.object_label(node)]
+
+    def test_a_walk_within_the_limit_records_no_stop(self, prc: ModuleType) -> None:
+        """The negative half: an ordinary tree reports nothing."""
+        node = pikepdf.Dictionary(ActualText=pikepdf.String("shallow"))
+        stops: list[str] = []
+        assert list(prc.walk_struct(node, set(), stops=stops)) == ["shallow"]
+        assert stops == []
 
     def test_kid_arrays_are_walked(self, prc: ModuleType) -> None:
         node = pikepdf.Dictionary(
@@ -1540,6 +1820,29 @@ class TestStringSweepEdges:
         prc._walk_strings(pikepdf.String("deep"), set(), found, 65)
         assert found == []
 
+    def test_the_depth_limit_records_where_it_stopped(self, prc: ModuleType) -> None:
+        """A string below the limit is a string nobody swept.
+
+        This is the sweep a secret is matched against when no other
+        layer claims the text, so a walk that gave up without saying so
+        turns "not found" into "not looked for".
+        """
+        with pikepdf.new() as pdf:
+            node = pdf.make_indirect(pikepdf.Dictionary(T=pikepdf.String("deep")))
+            found: list[str] = []
+            stops: list[str] = []
+            prc._walk_strings(node, set(), found, 65, stops)
+        assert found == []
+        assert stops == [prc.object_label(node)]
+
+    def test_a_sweep_within_the_limit_records_no_stop(self, prc: ModuleType) -> None:
+        """The negative half: an ordinary object graph reports nothing."""
+        found: list[str] = []
+        stops: list[str] = []
+        prc._walk_strings(pikepdf.String("shallow"), set(), found, 0, stops)
+        assert found == ["shallow"]
+        assert stops == []
+
     def test_binary_keys_are_never_walked(self, prc: ModuleType) -> None:
         found: list[str] = []
         node = pikepdf.Dictionary(ID=pikepdf.String("binary-ish"))
@@ -1584,6 +1887,80 @@ class TestStringSweepEdges:
             metadata = prc.extract_metadata(pdf)
         anonymous = [e.location for e in metadata if e.text == "anonymous"]
         assert sorted(anonymous) == ["DocInfo /Author", "DocInfo /Creator"]
+
+
+class TestNestingBeyondTheWalks:
+    """Every walk stops somewhere, and every walk says where.
+
+    `deep_nesting.pdf` nests a tag tree and a chain of Form XObjects
+    deeper than anything here follows, and puts the address at the
+    bottom of the tag tree. Nothing recovers it -- the walks stop, which
+    is what keeps a hostile file from running this forever. What must
+    never happen is the rest: reporting the part that was read as though
+    it were the document.
+    """
+
+    def details(self, prc: ModuleType, fixtures: Path, check: str) -> list[str]:
+        """Return the warnings one layer reports about the sample."""
+        report, _ = prc.analyze(fixtures / "deep_nesting.pdf", [SECRET])
+        return [
+            f.detail
+            for f in report.findings
+            if f.check == check and f.severity is prc.Severity.WARNING
+        ]
+
+    @pytest.mark.parametrize(
+        "check",
+        ["STRUCTURE_TREE", "CONTENT_STREAM", "FONT_CHARSET", "RAW_STRINGS"],
+    )
+    def test_every_bounded_walk_reports_the_limit(
+        self, prc: ModuleType, fixtures: Path, check: str
+    ) -> None:
+        """One per walk: the tag tree, the forms the page draws, the
+        resources reached through them, and the string sweep."""
+        details = self.details(prc, fixtures, getattr(prc, check))
+        assert [d for d in details if "more than 64 levels deep" in d]
+
+    def test_the_place_each_walk_gave_up_is_named(
+        self, prc: ModuleType, fixtures: Path
+    ) -> None:
+        """A count with no location leaves nowhere to look."""
+        report, _ = prc.analyze(fixtures / "deep_nesting.pdf", [SECRET])
+        stopped = [f for f in report.findings if "more than 64 levels deep" in f.detail]
+        assert len(stopped) == 4
+        assert all(f.location for f in stopped)
+
+    def test_the_tag_tree_is_not_reported_as_empty(
+        self, prc: ModuleType, fixtures: Path
+    ) -> None:
+        """The INFO line says how much was read, and reads as the whole
+        of the tree unless something says otherwise."""
+        report, _ = prc.analyze(fixtures / "deep_nesting.pdf", [])
+        tree = [f for f in report.findings if f.check == prc.STRUCTURE_TREE]
+        counted = [f for f in tree if "structure text inspected" in f.detail]
+        assert len(counted) == 1
+        assert "0 characters" in counted[0].detail
+        assert [f for f in tree if f.severity is prc.Severity.WARNING]
+
+    @pytest.mark.parametrize("secrets", [[], [SECRET]])
+    def test_the_document_is_never_reported_clean(
+        self, prc: ModuleType, fixtures: Path, secrets: list[str]
+    ) -> None:
+        """The verdict this sample exists for.
+
+        The address is in the file and out of reach either way. A run
+        that ended in "no evidence of surviving content" would be the
+        tool saying it had looked.
+        """
+        report, _ = prc.analyze(fixtures / "deep_nesting.pdf", secrets)
+        assert prc.verdict_code(report) == prc.EXIT_SUSPICIOUS
+
+    def test_an_ordinary_document_reports_no_depth_problem(
+        self, prc: ModuleType, fixtures: Path
+    ) -> None:
+        """The negative half: nothing here nests anywhere near the limit."""
+        report, _ = prc.analyze(fixtures / "clean.pdf", [SECRET])
+        assert not [f for f in report.findings if "levels deep" in f.detail]
 
 
 class TestOutputPathEdges:

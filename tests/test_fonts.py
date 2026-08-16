@@ -583,10 +583,90 @@ class TestFormResourceFonts:
             labels = [label for label, _ in prc.iter_fonts(pdf)]
         assert labels == ["page 1 /Fm0 /FForm"]
 
-    def test_the_depth_limit_stops_the_walk(self, prc: ModuleType) -> None:
-        """Forms nest, so this walk is bounded like the others."""
-        resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=pikepdf.Dictionary()))
-        assert list(prc.resource_fonts(resources, "page 1 ", set(), depth=65)) == []
+    def nested_forms(self, pdf: pikepdf.Pdf, depth: int) -> pikepdf.Object:
+        """Return a form `depth` layers of form deep, with a font inside.
+
+        Each layer brings resources of its own, which is what makes the
+        walk descend into it, and the font at the bottom is the thing
+        that is only reached by walking all the way down.
+        """
+        stream = pdf.make_stream(b"BT /FDeep 12 Tf (deep) Tj ET")
+        stream["/Type"] = pikepdf.Name("/XObject")
+        stream["/Subtype"] = pikepdf.Name("/Form")
+        stream["/BBox"] = [0, 0, 10, 10]
+        stream["/Resources"] = pikepdf.Dictionary(
+            Font=pikepdf.Dictionary(
+                FDeep=pikepdf.Dictionary(
+                    Type=pikepdf.Name("/Font"),
+                    Subtype=pikepdf.Name("/Type1"),
+                    BaseFont=pikepdf.Name("/Helvetica"),
+                )
+            )
+        )
+        inner = pdf.make_indirect(stream)
+        for _ in range(depth):
+            outer = pdf.make_stream(b"q /Fm Do Q")
+            outer["/Type"] = pikepdf.Name("/XObject")
+            outer["/Subtype"] = pikepdf.Name("/Form")
+            outer["/BBox"] = [0, 0, 10, 10]
+            outer["/Resources"] = pikepdf.Dictionary(
+                XObject=pikepdf.Dictionary(Fm=inner)
+            )
+            inner = pdf.make_indirect(outer)
+        return inner
+
+    def test_the_depth_limit_stops_the_walk_and_records_it(
+        self, prc: ModuleType
+    ) -> None:
+        """Forms nest, so this walk is bounded like the others.
+
+        A font below the bound is a font whose leftovers nobody looked
+        for, so where the walk gave up is recorded rather than passed
+        over.
+        """
+        with pikepdf.new() as pdf:
+            page = pdf.add_blank_page()
+            page.Resources = pikepdf.Dictionary(
+                XObject=pikepdf.Dictionary(
+                    Fm0=self.nested_forms(pdf, prc.MAX_DEPTH + 1)
+                )
+            )
+            stops: list[str] = []
+            labels = [label for label, _ in prc.iter_fonts(pdf, stops)]
+        assert labels == []
+        assert len(stops) == 1
+        assert stops[0].startswith("object ")
+
+    def test_the_walk_stops_the_same_way_with_nobody_collecting(
+        self, prc: ModuleType
+    ) -> None:
+        """A caller that is not reporting still gets a bounded walk.
+
+        The place it gave up is dropped rather than recorded, exactly as
+        an unread font is described only to a caller who asked for the
+        descriptions -- but the bound itself is not the collector's job.
+        """
+        with pikepdf.new() as pdf:
+            page = pdf.add_blank_page()
+            page.Resources = pikepdf.Dictionary(
+                XObject=pikepdf.Dictionary(
+                    Fm0=self.nested_forms(pdf, prc.MAX_DEPTH + 1)
+                )
+            )
+            assert list(prc.iter_fonts(pdf)) == []
+
+    def test_a_shallow_nest_is_walked_to_the_bottom(self, prc: ModuleType) -> None:
+        """The negative half: the same shape within the limit yields the
+        font and records nothing."""
+        with pikepdf.new() as pdf:
+            page = pdf.add_blank_page()
+            page.Resources = pikepdf.Dictionary(
+                XObject=pikepdf.Dictionary(Fm0=self.nested_forms(pdf, 2))
+            )
+            stops: list[str] = []
+            labels = [label for label, _ in prc.iter_fonts(pdf, stops)]
+        assert labels == ["page 1 /Fm0 /Fm /Fm /FDeep"]
+        assert stops == []
 
 
 def font_declaring(pdf: pikepdf.Pdf, name: str, first: int, count: int) -> None:
@@ -637,6 +717,30 @@ class TestOrphanSeverity:
         failed, _ = prc.analyze(fixtures / "orphan_font.pdf", [])
         assert prc.verdict_code(warned) == prc.EXIT_SUSPICIOUS
         assert prc.verdict_code(failed) == prc.EXIT_RECOVERABLE
+
+    def test_the_short_side_is_a_real_orphan_and_not_just_a_warning(
+        self, prc: ModuleType, fixtures: Path
+    ) -> None:
+        """What makes `broken_fonts.pdf` the sample for the short side.
+
+        Its /FBadWidth declares two codes and the page draws one of
+        them, so the other is a single orphan. The verdict above would
+        stay SUSPICIOUS on the strength of the unreadable fonts alone,
+        which is why the finding itself is asserted here: anything later
+        added to the sample that happens to draw a C would take the
+        one-orphan case away without failing a test.
+        """
+        report, _ = prc.analyze(fixtures / "broken_fonts.pdf", [])
+        orphans = [
+            f
+            for f in report.findings
+            if f.location == "page 1 /FBadWidth"
+            and "absent from visible text" in f.detail
+        ]
+        assert len(orphans) == 1
+        assert orphans[0].severity is prc.Severity.WARNING
+        assert "1 character(s)" in orphans[0].detail
+        assert repr("C") in orphans[0].detail
 
 
 class TestUnreadableFontDictionaries:
@@ -722,6 +826,74 @@ class TestUnreadableFontDictionaries:
         problems: list[str] = []
         assert prc.font_charset(font, problems) == []
         assert problems == []
+
+    @pytest.mark.parametrize("value", [42, 4.5, True, pikepdf.Name("/Helvetica")])
+    def test_a_font_resource_that_is_not_a_dictionary_is_reported(
+        self, prc: ModuleType, value: object
+    ) -> None:
+        """Hostile input: a /Font group holds whatever it was given.
+
+        pikepdf hands a number, a real number or a boolean back as the
+        plain Python object, none of which has the methods a font is
+        read with, so reading one used to end the whole run in a
+        traceback -- and a run that ended there printed no findings at
+        all, whatever else the document was carrying.
+        """
+        problems: list[str] = []
+        assert prc.font_charset(value, problems) == []
+        assert len(problems) == 1
+        assert "not a font dictionary" in problems[0]
+
+    @pytest.mark.parametrize(
+        "value",
+        [42, 4.5, True, pikepdf.Array([1]), pikepdf.Dictionary(Type="/CMap")],
+    )
+    def test_a_tounicode_that_is_not_a_stream_is_reported(
+        self, prc: ModuleType, value: object
+    ) -> None:
+        """A character map lives in a stream, so anything else is not one.
+
+        The same class of input as above, in the other place a font hands
+        one over: /ToUnicode. A value that is not a stream has no bytes
+        to parse, and saying so is what keeps it from reading as a font
+        that maps nothing.
+        """
+        font = pikepdf.Dictionary(
+            Type=pikepdf.Name("/Font"),
+            Subtype=pikepdf.Name("/Type1"),
+            BaseFont=pikepdf.Name("/Helvetica"),
+            ToUnicode=value,
+        )
+        problems: list[str] = []
+        assert prc.read_tounicode(font, problems) is None
+        assert len(problems) == 1
+        assert "/ToUnicode" in problems[0] and "not a stream" in problems[0]
+
+    def test_a_font_with_no_tounicode_reports_nothing(self, prc: ModuleType) -> None:
+        """The negative half: an absent entry is not a malformed one."""
+        font = pikepdf.Dictionary(
+            Type=pikepdf.Name("/Font"),
+            Subtype=pikepdf.Name("/Type1"),
+            BaseFont=pikepdf.Name("/Helvetica"),
+        )
+        problems: list[str] = []
+        assert prc.read_tounicode(font, problems) is None
+        assert problems == []
+
+    def test_the_scalar_fonts_of_the_corpus_are_reported(
+        self, prc: ModuleType, fixtures: Path
+    ) -> None:
+        """The same two shapes, in a document on disk.
+
+        `broken_fonts.pdf` draws with both of them, so this also proves
+        the run survives them: a font that cannot be read costs the text
+        it drew, not the report.
+        """
+        report, _ = prc.analyze(fixtures / "broken_fonts.pdf", [])
+        details = {f.location: f.detail for f in report.findings}
+        assert "not a font dictionary" in details["page 1 /FScalar"]
+        assert "not a stream" in details["page 1 /FScalarCMap"]
+        assert prc.verdict_code(report) == prc.EXIT_SUSPICIOUS
 
     def test_a_font_that_could_not_be_read_is_not_reported_as_empty(
         self, prc: ModuleType, fixtures: Path, monkeypatch: pytest.MonkeyPatch
@@ -826,6 +998,42 @@ class TestDecodedPageText:
         assert "page 1 /Fm1 /FInner" in labels
         assert not [label for label in labels if label.startswith("page 1 /Fm0 ")]
         assert len(labels) == len(set(labels))
+
+    def test_the_font_a_Q_puts_back_is_what_the_page_draws_with(
+        self, prc: ModuleType, fixtures: Path
+    ) -> None:
+        """Both directions of the defect, on the committed sample.
+
+        `saved_state.pdf` draws three codes after a `Q` has put /FKept
+        back in effect. Read through the /FDropped the q ... Q pair
+        selected, those codes spell three of the four characters
+        /FDropped declares -- so the leftovers that font really carries
+        stop looking like leftovers, and the three characters /FKept
+        declares and draws go missing from the page text instead.
+        """
+        report, _ = prc.analyze(fixtures / "saved_state.pdf", [])
+        fonts = [f for f in report.findings if f.check == prc.FONT_CHARSET]
+        assert [f.location for f in fonts] == ["page 1 /FDropped"]
+        assert fonts[0].severity is prc.Severity.CRITICAL
+        assert repr("ÙŸŽ") in fonts[0].detail
+
+        with pikepdf.open(fixtures / "saved_state.pdf") as pdf:
+            visible = prc.extract_page_text(pdf)
+        assert all(char in visible for char in "ÁÉÍ")
+        assert not [char for char in "ÙŸŽ" if char in visible]
+
+    def test_the_saved_state_sample_draws_what_its_glyph_names_say(
+        self, prc: ModuleType, maketests: ModuleType
+    ) -> None:
+        """The generator names glyphs; the tool resolves them.
+
+        The sample is only evidence of anything if the two agree on
+        which characters those names stand for.
+        """
+        kept = [prc.GLYPH_NAMES[name] for name in maketests.KEPT_GLYPH_NAMES]
+        dropped = [prc.GLYPH_NAMES[name] for name in maketests.DROPPED_GLYPH_NAMES]
+        assert kept == ["Á", "É", "Í"]
+        assert dropped == ["Ò", "Ù", "Ÿ", "Ž"]
 
     def test_curly_quotes_are_read_as_quotes(
         self, prc: ModuleType, fixtures: Path

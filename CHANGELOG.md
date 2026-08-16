@@ -9,6 +9,46 @@ bump.
 
 ## [Unreleased]
 
+### Fixed
+
+- Page text is now read through the font a `Q` puts back. The font is part of
+  the graphics state that `q` saves and `Q` restores, and ordinary producers
+  wrap blocks of drawing in the pair, so ignoring it read the text after a `Q`
+  through whichever font was selected inside — inventing characters the page
+  never drew, which can hide a font subset's real leftovers, and losing the
+  ones it did draw, which reported a clean font as the remnant of a removed
+  passage. A form's content is drawn inside a save of its own, so neither half
+  of a pair crosses into or out of one, and a `Q` with nothing left to restore
+  is reported rather than passed over.
+- A `/Font` resource that is a number, and a `/ToUnicode` entry that is a
+  number, are reported instead of ending the run. pikepdf hands a number back
+  as a plain Python object, which has none of the methods a font is read with,
+  so one of these used to raise part way through — printing no findings at all,
+  whatever else the document was carrying.
+- Every walk that stops at the depth limit now says where it gave up. The tag
+  tree, the object graph swept for string objects, forms drawn inside forms,
+  and the resources reached through them are all bounded, because a hostile
+  file can nest a structure forever; stopping quietly meant a document whose
+  content nobody could reach came back as a document with nothing in it. Two
+  more layers can now report something they could not read — the structure tree
+  and the string-object sweep — so seven of them can, rather than the five
+  listed under 0.1.0.
+- A form drawn twice from two different places is read both times when the two
+  share one `/Resources` dictionary. A drawing is now told apart by the stream
+  that drew it as well as by the innermost resources in effect there, because
+  neither is enough alone, and text the second drawing put on the page was
+  going missing from the page text.
+
+### Changed
+
+- A `--secret` with nothing in it, or with nothing but whitespace, is now a
+  usage error (exit code `4`) rather than a search. Text with nothing in it is
+  in every document ever written, so it reported every document as a failed
+  redaction; the shape it arrives in is a CI gate running `--secret "$NAME"`
+  with the variable unset. Blank lines in a `--secret-file` are still skipped,
+  because that file holds one secret per line and a line with nothing on it is
+  formatting rather than a request.
+
 ## [0.1.0] - 2026-08-02
 
 First release.
