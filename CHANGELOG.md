@@ -9,6 +9,8 @@ bump.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-16
+
 ### Changed
 
 - A `--secret` with nothing in it, or with nothing but whitespace, is now a
@@ -83,14 +85,27 @@ bump.
   going missing from the page text, and the font that really did draw it was
   then reported as carrying the remnants of a removed passage. A font
   dictionary written out in place, rather than as an object of its own, has no
-  object number to be told apart by, so what stands in for one there is what
-  the font turns character codes into: two such fonts that draw different text
-  are two drawings, and two that draw the same text are one.
+  object number to be told apart by, so what stands in for one there is how the
+  font reads a run of bytes: how many of them a character code takes, and what
+  each code turns into. Both matter, because a font that reads a byte at a time
+  and one that reads two turn the same bytes into different text even when they
+  agree on every code. Two such fonts that draw different text are two
+  drawings, and two that draw the same text are one.
 - A page whose `/Contents` is not drawing instructions is reported rather than
   read as a page that draws nothing. A content parser hands back no
   instructions at all for a `/Contents` that is a number or a dictionary, and
   passes over an array entry that is not a stream, so a document whose text
   nobody could read used to end in "no evidence of surviving content".
+- Attachments are measured again on the older pikepdf releases this project
+  says it supports. A file specification names its stream `/F`, or `/UF`, or
+  both, and choosing between them asked whether the first was truthy — which is
+  not the same question as whether it is there, and which pikepdf before 8.7
+  declines to answer for a stream at all, raising instead. Asking about the type
+  is the question that was meant, and it picks up a case the old spelling
+  missed: a `/F` that is there but is not a stream now falls through to `/UF`
+  rather than being taken as the answer. The suite now runs against the oldest
+  pikepdf the packaging allows, so the versions this project supports and the
+  versions it is tested against are the same set.
 
 ## [0.1.0] - 2026-08-02
 
@@ -184,5 +199,6 @@ First release.
 
 [kac]: https://keepachangelog.com/en/1.1.0/
 [semver]: https://semver.org/spec/v2.0.0.html
-[Unreleased]: https://github.com/seanthegeek/pdf-redaction-check/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/seanthegeek/pdf-redaction-check/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/seanthegeek/pdf-redaction-check/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/seanthegeek/pdf-redaction-check/releases/tag/v0.1.0

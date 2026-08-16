@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pdf-redaction-check"
-version = "0.1.0"
+version = "0.2.0"
 description = "Verify that a PDF redaction actually removed the content, instead of just covering it up."
 readme = "README.md"
 requires-python = ">=3.11"
