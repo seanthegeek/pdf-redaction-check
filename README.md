@@ -192,8 +192,9 @@ outside the text layer reports under two names: `raw-objects` for stream data,
   from, after which the text is read on the assumption that a reader would
   leave the font where it stands;
 - `font-charset`: a font whose character map, `/Widths` array, or `/FirstChar`
-  cannot be read, a descendant font entry that is not a font dictionary, a
-  `/Font` resource that is not a font dictionary at all, a `/ToUnicode` entry
+  cannot be read, a `/DescendantFonts` entry that is not an array or that holds
+  something other than a font dictionary, a `/Font` resource that is not a font
+  dictionary at all, a `/ToUnicode` entry
   that is not the stream a character map lives in, forms nested past that same
   limit, so that the fonts inside them were never reached, or a font's chain of
   descendant fonts nested past it, so that what the font at the bottom declares

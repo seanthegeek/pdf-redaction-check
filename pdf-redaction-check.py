@@ -287,7 +287,7 @@ DumpMode = Literal["hidden", "all"]
 # out in place, which has no number of its own -- what that font turns
 # every character code into. See `font_identity`. The two are different
 # shapes, so a font of one kind is never mistaken for one of the other.
-FontIdentity = tuple[int, int] | frozenset[tuple[int, str]]
+FontIdentity = tuple[int, int] | tuple[int, frozenset[tuple[int, str]]]
 
 # One drawing of a Form XObject: the form, the resource name of the font
 # in effect, which font that name resolved to, and the content stream
@@ -1317,7 +1317,9 @@ def simple_font_table(font: pikepdf.Object) -> dict[int, str]:
     return table
 
 
-def font_identity(font: pikepdf.Object, table: dict[int, str]) -> FontIdentity:
+def font_identity(
+    font: pikepdf.Object, code_bytes: int, table: dict[int, str]
+) -> FontIdentity:
     """Name the font a drawing was made with, for `already_drawn`.
 
     A font dictionary that is an indirect object is named by its number
@@ -1328,15 +1330,21 @@ def font_identity(font: pikepdf.Object, table: dict[int, str]) -> FontIdentity:
     one resource name look like one font -- which drops the second
     drawing's text, and leaves the font that really drew it looking like
     it declares characters the page never showed. What stands in for the
-    number is what the font turns character codes into: two fonts that
-    turn every code into the same characters draw the same text, so
-    treating those two as one costs nothing, and two that do not are
-    told apart.
+    number is how the font reads a run of bytes: how many bytes it takes
+    per character code, and what each code turns into. Both matter. Two
+    fonts can agree on every code and still draw different text, because
+    one reads the bytes a code at a time and the other two at a time --
+    so the width has to be part of the name, or a one-byte font and a
+    two-byte font with the same table look like one font and the second
+    drawing's text is dropped.
+
+    A width paired with a table cannot collide with a number and
+    generation: the second half of one is a set, of the other an int.
     """
     objgen = getattr(font, "objgen", (0, 0))
     if objgen != (0, 0):
         return objgen
-    return frozenset(table.items())
+    return (code_bytes, frozenset(table.items()))
 
 
 def font_decoder(label: str, font: pikepdf.Object) -> FontDecoder:
@@ -1353,7 +1361,7 @@ def font_decoder(label: str, font: pikepdf.Object) -> FontDecoder:
         table.update(simple_font_table(font))
     if cmap is not None:
         table.update(cmap.entries)
-    return FontDecoder(label, code_bytes, table, font_identity(font, table))
+    return FontDecoder(label, code_bytes, table, font_identity(font, code_bytes, table))
 
 
 @dataclass(frozen=True)

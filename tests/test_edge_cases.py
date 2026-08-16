@@ -754,6 +754,53 @@ class TestFormXObjects:
         assert text == "x"
         assert orphans == {}
 
+    def test_a_direct_font_is_told_apart_by_how_wide_its_codes_are(
+        self, prc: ModuleType
+    ) -> None:
+        """Agreeing on every code is not enough to draw the same text.
+
+        A font that takes one byte per code and a font that takes two
+        turn the same run of bytes into different text even when their
+        tables are identical, so the width has to be part of what names
+        a font that has no object number. Leaving it out makes the two
+        look like one drawing and drops the second one's text.
+        """
+        font = pikepdf.Dictionary(
+            Type=pikepdf.Name("/Font"),
+            Subtype=pikepdf.Name("/Type1"),
+            BaseFont=pikepdf.Name("/Helvetica"),
+        )
+        table = {1: "x"}
+        assert prc.font_identity(font, 1, table) != prc.font_identity(font, 2, table)
+
+    def test_a_direct_font_is_the_same_font_as_itself(self, prc: ModuleType) -> None:
+        """The negative half: the width must not make every font unique.
+
+        Two readings of one font agree on both halves, so they are one
+        drawing -- without which a form that draws itself would be read
+        again at every level down to the depth limit.
+        """
+        font = pikepdf.Dictionary(
+            Type=pikepdf.Name("/Font"),
+            Subtype=pikepdf.Name("/Type1"),
+            BaseFont=pikepdf.Name("/Helvetica"),
+        )
+        assert prc.font_identity(font, 2, {1: "x"}) == prc.font_identity(
+            font, 2, {1: "x"}
+        )
+
+    def test_a_direct_font_cannot_be_mistaken_for_an_object_number(
+        self, prc: ModuleType
+    ) -> None:
+        """Both shapes are pairs, so they have to differ in the second.
+
+        A width beside a table and a number beside a generation are both
+        two things; what keeps them apart is that one ends in a set and
+        the other in a number.
+        """
+        direct = pikepdf.Dictionary(Type=pikepdf.Name("/Font"))
+        assert prc.font_identity(direct, 1, {1: "x"}) != (1, 0)
+
     def test_a_form_drawn_twice_under_one_font_is_read_once(
         self, prc: ModuleType
     ) -> None:
