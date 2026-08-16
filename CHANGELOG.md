@@ -23,6 +23,23 @@ bump.
 
 ### Fixed
 
+- A page's drawing instructions are now read one at a time instead of all at
+  once, so how many of them a page holds no longer decides what reading it
+  costs. Instructions compress extremely well — a `q` is two bytes — so a
+  four-kilobyte page holding two million of them used to cost about 590 MB to
+  read, and now costs about 40 MB whatever the count. Grouping the operands
+  with their operator is now this tool's own job, so it bounds them: an
+  instruction is read with at most 64 of them, the ones written last, because
+  those are the ones an operator uses, and an instruction that carried more
+  says so rather than passing over what was dropped. Ordinary documents are
+  nowhere near that limit. What is still not bounded is the size of one
+  operand, which the README now says under "Limitations".
+- A form drawn by a name nothing defines is now described once, with a count of
+  how often it was drawn, instead of once for every drawing. That changes the
+  wording of an existing warning, and it took a page of a few tens of kilobytes
+  that draws two million such forms from about 1.7 GB to about 60 MB. What a
+  stream had already counted is also reported when reading it fails part way
+  through, rather than going down with the failure.
 - Page text is now read through the font a `Q` puts back. The font is part of
   the graphics state that `q` saves and `Q` restores, and ordinary producers
   wrap blocks of drawing in the pair, so ignoring it read the text after a `Q`
@@ -31,7 +48,10 @@ bump.
   ones it did draw, which reported a clean font as the remnant of a removed
   passage. A form's content is drawn inside a save of its own, so neither half
   of a pair crosses into or out of one, and a `Q` with no `q` left to restore
-  from is reported rather than passed over.
+  from is reported rather than passed over. Only 64 saved states are kept,
+  because a `q` is two bytes that compress to almost nothing and a file could
+  otherwise ask for as much memory as the machine has; a `Q` that asks for one
+  saved deeper than that leaves the font where it stands and says so.
 - A `/Font` resource that is a number, and a `/ToUnicode` entry that is a
   number, are reported instead of ending the run. pikepdf hands a number back
   as a plain Python object, which has none of the methods a font is read with,

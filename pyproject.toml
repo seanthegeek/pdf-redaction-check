@@ -23,6 +23,11 @@ classifiers = [
     "Topic :: Security",
     "Topic :: Text Processing :: Filters",
 ]
+# This floor is also what the one private name the tool imports needs:
+# pikepdf._core.StreamParser, which reads a content stream one object at
+# a time rather than building a list of every instruction in it. That
+# class, Page.parse_contents and Object._parse_stream have all been
+# where they are since pikepdf 8.0.
 dependencies = ["pikepdf>=8"]
 
 [project.optional-dependencies]

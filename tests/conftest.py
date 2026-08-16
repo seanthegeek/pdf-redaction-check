@@ -28,6 +28,7 @@ SAMPLE_NAMES = (
     "broken_fonts.pdf",
     "clean.pdf",
     "cleartext_stream.pdf",
+    "costly_stream.pdf",
     "deep_nesting.pdf",
     "differences.pdf",
     "fake_redacted.pdf",

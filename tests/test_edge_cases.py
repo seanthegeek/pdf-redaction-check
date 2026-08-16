@@ -13,6 +13,8 @@ from __future__ import annotations
 import base64
 import os
 import re
+import subprocess
+import sys
 import zlib
 from collections.abc import Callable
 from pathlib import Path
@@ -21,8 +23,39 @@ from typing import Any
 
 import pikepdf
 import pytest
+from conftest import ROOT
 
 SECRET = "742 Evergreen Terrace"
+
+# How much address space the tool is given for the test that reads a
+# content stream built to be expensive. Reading that stream one
+# instruction at a time takes about 40 MB; building the whole list of
+# them first takes about 590 MB, so a cap between the two decides the
+# question either way, with room for an interpreter that allocates
+# differently from this one.
+ADDRESS_SPACE_CAP = 256 * 1024 * 1024
+
+# RLIMIT_AS is what makes that cap real, and it is enforced on Linux.
+# macOS accepts the call and does not act on it, and Windows has no such
+# limit at all, either of which would turn the test into one that passes
+# whatever the tool does.
+linux_only = pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="RLIMIT_AS caps a process's memory only on Linux",
+)
+
+
+def cap_address_space() -> None:
+    """Cap the address space of the child process about to be run.
+
+    `resource` is imported here rather than beside the other imports
+    because it is a Unix module: importing it where the whole file
+    depends on it would stop every test here from running on a platform
+    that has no such thing, over the one test that platform skips.
+    """
+    import resource
+
+    resource.setrlimit(resource.RLIMIT_AS, (ADDRESS_SPACE_CAP, ADDRESS_SPACE_CAP))
 
 
 class TestReportModel:
@@ -962,7 +995,7 @@ class TestFormXObjects:
         assert finding.severity is prc.Severity.WARNING
         assert finding.check == prc.CONTENT_STREAM
         assert finding.location == "page 1"
-        assert "a form was drawn as /Fm9" in finding.detail
+        assert "a form was drawn 1 time(s) as /Fm9" in finding.detail
         assert "do not define" in finding.detail
 
     def test_drawing_on_a_page_that_names_no_xobjects_is_reported_too(
@@ -974,7 +1007,27 @@ class TestFormXObjects:
             )
         assert text == "outside"
         assert [f.check for f in report.findings] == [prc.CONTENT_STREAM]
-        assert "a form was drawn as /Fm0" in report.findings[0].detail
+        assert "a form was drawn 1 time(s) as /Fm0" in report.findings[0].detail
+
+    def test_a_name_nothing_defines_is_described_once_however_often_drawn(
+        self, prc: ModuleType
+    ) -> None:
+        """The count is the report, not a line for each drawing.
+
+        Drawing a form is a handful of bytes that compress to almost
+        nothing, and a name nothing defines is still undefined the next
+        time it is drawn, so describing every drawing would let a file
+        of a few kilobytes ask for as much memory as the machine has --
+        and would bury the one observation under a million copies of
+        itself.
+        """
+        with pikepdf.new() as pdf:
+            text, report = self.read(
+                prc, pdf, b"BT /F1 12 Tf (outside) Tj ET " + b"/Fm0 Do " * 500
+            )
+        assert text == "outside"
+        assert len(report.findings) == 1
+        assert "a form was drawn 500 time(s) as /Fm0" in report.findings[0].detail
 
     def test_an_operand_that_is_not_a_name_is_skipped(self, prc: ModuleType) -> None:
         """`Do` takes one name; anything else names no resource."""
@@ -1233,6 +1286,253 @@ class TestSavedGraphicsState:
             )
         assert text == "zyABAB"
         assert report.findings == []
+
+
+class TestStreamsBuiltToCost:
+    """A content stream may not cost more memory than it is worth.
+
+    Drawing instructions compress extremely well -- a `q` is two bytes,
+    an operand can be one -- so a file of a few kilobytes holds millions
+    of them. How many of them a stream holds must not decide what
+    reading it costs, and each bound that keeps it from deciding has to
+    say when it was reached. How large a single operand is stays the
+    parser's business, which the README says under "Limitations".
+    """
+
+    def read(
+        self, prc: ModuleType, contents: bytes
+    ) -> tuple[str, list[str], list[str]]:
+        """Read one page of `contents` drawn with a font of known letters.
+
+        Codes 1 and 2 are control codes in every base encoding, so what
+        they spell is decided entirely by this /Differences array.
+        """
+        with pikepdf.new() as pdf:
+            page = pdf.add_blank_page()
+            page.Resources = pikepdf.Dictionary(
+                Font=pikepdf.Dictionary(
+                    F1=pdf.make_indirect(
+                        pikepdf.Dictionary(
+                            Type=pikepdf.Name("/Font"),
+                            Subtype=pikepdf.Name("/Type1"),
+                            BaseFont=pikepdf.Name("/Helvetica"),
+                            Encoding=pikepdf.Dictionary(
+                                Type=pikepdf.Name("/Encoding"),
+                                Differences=[1, pikepdf.Name("/a"), pikepdf.Name("/b")],
+                            ),
+                        )
+                    )
+                )
+            )
+            page.Contents = pdf.make_stream(contents)
+            return prc._page_text(page)
+
+    def test_operands_past_the_limit_are_dropped_and_said(
+        self, prc: ModuleType
+    ) -> None:
+        """The operands wait for an operator, and only so many wait.
+
+        A show-text operator takes one operand; this one is given three
+        more than the limit reads. The text of the operands that were
+        kept is read, which is what makes the ones that were dropped
+        worth saying out loud rather than passing over.
+
+        Which three go is the point of the two codes. An operator takes
+        the operands nearest it, so the ones written first are the ones
+        a reader never draws with -- dropping from the other end would
+        throw away exactly the text on the screen and keep the padding
+        in front of it.
+        """
+        text, problems, _ = self.read(
+            prc,
+            b"BT /F1 12 Tf " + b"<01> " * 3 + b"<02> " * prc.MAX_OPERANDS + b"Tj ET",
+        )
+        assert text == "b" * prc.MAX_OPERANDS
+        assert len(problems) == 1
+        assert "3 operand(s)" in problems[0]
+        assert str(prc.MAX_OPERANDS) in problems[0]
+
+    def test_operands_up_to_the_limit_are_all_read(self, prc: ModuleType) -> None:
+        """The negative half: the limit is not hit one operand early.
+
+        Without this, moving the limit down would look like a fix for
+        the test above rather than a change in what the tool reads.
+        """
+        text, problems, _ = self.read(
+            prc, b"BT /F1 12 Tf " + b"<01> " * prc.MAX_OPERANDS + b"Tj ET"
+        )
+        assert text == "a" * prc.MAX_OPERANDS
+        assert problems == []
+
+    def test_operands_are_counted_for_the_instruction_they_belong_to(
+        self, prc: ModuleType
+    ) -> None:
+        """Each operator clears what piled up, so nothing carries over.
+
+        Two instructions of half the limit each are two instructions, not
+        one long one: reporting them as one would mean the count had
+        stopped being per-instruction and started being per-stream.
+        """
+        half = prc.MAX_OPERANDS // 2
+        text, problems, _ = self.read(
+            prc,
+            b"BT /F1 12 Tf " + b"<01> " * half + b"Tj " + b"<02> " * half + b"Tj ET",
+        )
+        assert text == "a" * half + "b" * half
+        assert problems == []
+
+    def test_an_inline_image_leaves_the_text_around_it_alone(
+        self, prc: ModuleType
+    ) -> None:
+        """A picture written into the stream is still a picture.
+
+        qpdf hands an inline image over as the `BI` operator, the
+        entries of the image's dictionary, `ID`, the image data as an
+        object of its own, and `EI`. Losing count of the operands around
+        any of those would change what the text on either side spells.
+        """
+        text, problems, _ = self.read(
+            prc,
+            b"BT /F1 12 Tf <01> Tj ET\n"
+            b"BI /W 2 /H 2 /CS /G /BPC 8 ID \x00\x11\x22\x33 EI\n"
+            b"BT <02> Tj ET\n",
+        )
+        assert text == "ab"
+        assert problems == []
+
+    def test_the_data_of_an_inline_image_is_not_read_as_text(
+        self, prc: ModuleType
+    ) -> None:
+        """The other half, which the stream above cannot show.
+
+        `EI` clears the operands before any show-text operator sees the
+        image data, so a page cannot demonstrate what would happen if
+        that data were read as a string. This takes the object qpdf
+        hands over for it -- there is no other way to build one -- and
+        asks the reader of show-text operands what it makes of it. The
+        answer has to be nothing: image data is bytes of a picture, and
+        a picture drawn on the page is not text the page draws.
+        """
+        captured: list[Any] = []
+
+        class Capture(prc.ContentReader):
+            def handle_object(self, obj: Any, offset: int, length: int) -> None:
+                captured.append(obj)
+                super().handle_object(obj, offset, length)
+
+        with pikepdf.new() as pdf:
+            page = pdf.add_blank_page()
+            page.Contents = pdf.make_stream(
+                b"BI /W 2 /H 2 /CS /G /BPC 8 ID \x00\x11\x22\x33 EI\n"
+            )
+            page.parse_contents(Capture(page, (None,), prc.PageText(), prc.NO_FONT, 0))
+        data = [
+            obj
+            for obj in captured
+            if getattr(obj, "_type_code", None) == pikepdf.ObjectType.inlineimage
+        ]
+        assert len(data) == 1, "the parser handed over no inline image data"
+        assert list(prc.show_text_bytes(data)) == []
+
+    def test_the_sample_says_each_of_its_two_faults_once(
+        self, prc: ModuleType, fixtures: Path
+    ) -> None:
+        """The committed sample, which is what proves this on a file.
+
+        `costly_stream.pdf` draws one show-text instruction carrying
+        more operands than are read, and draws a form five hundred times
+        by a name its resources do not define. Two lines of report, each
+        carrying its own count, rather than five hundred and one.
+        """
+        report, _ = prc.analyze(fixtures / "costly_stream.pdf", [])
+        content = [f for f in report.findings if f.check == prc.CONTENT_STREAM]
+        assert [f.location for f in content] == ["page 1", "page 1"]
+        assert "a form was drawn 500 time(s) as /Fm0" in content[0].detail
+        assert "6 operand(s)" in content[1].detail
+        assert prc.verdict_code(report) == prc.EXIT_SUSPICIOUS
+
+    def test_the_sample_keeps_the_end_of_its_over_long_instruction(
+        self, prc: ModuleType, fixtures: Path
+    ) -> None:
+        """The other half: what was kept was read, and it is the right half.
+
+        The instruction draws in the mode that puts no marks on the
+        page, so a viewer shows nothing there -- but the characters are
+        in the content stream, and text in a content stream is exactly
+        what this tool is looking for. Its last sixty-four operands draw
+        A-with-a-ring and the six in front of them draw a slashed O, so
+        an instruction read from the wrong end comes back as the second
+        character rather than the first.
+        """
+        with pikepdf.open(fixtures / "costly_stream.pdf") as pdf:
+            text = prc.extract_page_text(pdf)
+        assert "Å" * prc.MAX_OPERANDS in text
+        assert "Å" * (prc.MAX_OPERANDS + 1) not in text
+        assert "Ø" not in text
+
+    def test_what_a_form_dropped_is_said_even_though_it_failed(
+        self, prc: ModuleType, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A stream that fails half way through still says what it dropped.
+
+        The form here drops six operands and then meets something that
+        will not read -- a font resource is the shape that raises, so
+        that is what stands in for it. The page survives the failure and
+        reports the form as unread, which is true of the rest of it and
+        not of the part already counted: the drop happened, and a report
+        that mentions only the failure describes a form that dropped
+        nothing.
+        """
+
+        def explode(*args: Any) -> None:
+            raise ValueError("this font will not read")
+
+        monkeypatch.setattr(prc, "select_font", explode)
+        with pikepdf.new() as pdf:
+            form = pdf.make_stream(b"<01> " * (prc.MAX_OPERANDS + 6) + b"Tj /F1 12 Tf")
+            form["/Type"] = pikepdf.Name("/XObject")
+            form["/Subtype"] = pikepdf.Name("/Form")
+            form["/BBox"] = [0, 0, 10, 10]
+            page = pdf.add_blank_page()
+            page.Resources = pikepdf.Dictionary(
+                XObject=pikepdf.Dictionary(Fm0=pdf.make_indirect(form))
+            )
+            page.Contents = pdf.make_stream(b"q /Fm0 Do Q")
+            _, problems, _ = prc._page_text(page)
+        assert [p for p in problems if "6 operand(s)" in p]
+        assert [
+            p for p in problems if "the form drawn as /Fm0 could not be parsed" in p
+        ]
+
+    @linux_only
+    def test_a_stream_of_saved_states_is_read_in_bounded_memory(
+        self, prc: ModuleType, tmp_path: Path
+    ) -> None:
+        """The whole point: a 4 KB file may not cost half a gigabyte.
+
+        Two million `q` operators are four kilobytes of file, because
+        the same two bytes compress to almost nothing, and reading them
+        into a list of instructions costs hundreds of megabytes. This
+        runs the tool in a process whose address space is capped, which
+        fails with a memory error if the instructions are held all at
+        once and passes when they are read one at a time. It is the
+        cap, not the timing, that decides the result.
+        """
+        path = tmp_path / "bomb.pdf"
+        with pikepdf.new() as pdf:
+            page = pdf.add_blank_page()
+            page.Contents = pdf.make_stream(b"q " * 2_000_000)
+            pdf.save(path)
+        assert path.stat().st_size < 10_000
+        finished = subprocess.run(
+            [sys.executable, str(ROOT / "pdf-redaction-check.py"), str(path)],
+            capture_output=True,
+            text=True,
+            preexec_fn=cap_address_space,
+            check=False,
+        )
+        assert finished.returncode == prc.EXIT_CLEAN, finished.stderr
+        assert "MemoryError" not in finished.stderr
 
 
 class TestResourceGroups:

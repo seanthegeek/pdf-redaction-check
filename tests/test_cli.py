@@ -74,6 +74,11 @@ class TestExitCodes:
             # address is in the file and out of reach, so the run must
             # report what it could not read rather than nothing at all.
             ("deep_nesting.pdf", 1),
+            # Drawing instructions built to cost more memory than the
+            # file does: an instruction carrying more operands than are
+            # kept, and a form drawn five hundred times by a name
+            # nothing defines.
+            ("costly_stream.pdf", 1),
             # A stream that will not decompress: a layer of this
             # document nothing here could read, on a run given no
             # secret to look for.

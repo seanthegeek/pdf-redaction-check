@@ -188,9 +188,14 @@ outside the text layer reports under two names: `raw-objects` for stream data,
   stops — see "Limitations"; text drawn before any font was selected, with a
   font the resources in effect do not define, with a name they define as
   something other than a font dictionary, or with a character code that font
-  does not map; or a `Q` operator with no `q` left to restore a graphics state
-  from, after which the text is read on the assumption that a reader would
-  leave the font where it stands;
+  does not map; a `Q` operator with no `q` left to restore a graphics state
+  from, or one asking for a state saved more than 64 `q` operators deep, which
+  is as many as are kept, after either of which the text is read on the
+  assumption that a reader would leave the font where it stands; or an
+  instruction written with more than the 64 operands this reads — see
+  "Limitations" — which is more than any instruction a reader draws with, so
+  the ones written first were passed over and the ones written last, which are
+  the ones an operator uses, were kept;
 - `font-charset`: a font whose character map, `/Widths` array, or `/FirstChar`
   cannot be read, a `/DescendantFonts` entry that is not an array or that holds
   something other than a font dictionary, a `/Font` resource that is not a font
@@ -426,6 +431,22 @@ file is clean.
   graph and the tree of file names — so a default run says nothing about those
   two, as the list of warnings above notes. Ordinary documents are nowhere near
   the limit.
+- **Drawing instructions built to cost more than the file does.** Instructions
+  compress extremely well, so a page of a few kilobytes can hold millions of
+  them, and reading a page has to cost something closer to what the page draws
+  than to what it asks for. The instructions are read one at a time rather than
+  all at once, so how many of them a page holds no longer decides what reading
+  it costs. Two things are bounded on top of that, and each says so when it is
+  reached: an instruction is read with at most 64 operands — the ones written
+  last, because those are the ones an operator uses — and at most 64 saved
+  graphics states are kept for `q` and `Q` to restore the font from. Both
+  limits are far above anything a producer writes, the longest run of operands
+  on an ordinary page being the dictionary of an inline image, so reaching
+  either is a fact about the file rather than about the document. What none of
+  that bounds is the size of one operand: an array of a million empty strings
+  is a single operand, built whole by the parser before any of this sees it, so
+  a page whose instructions are few and enormous can still exhaust the memory
+  available and end the run with a traceback instead of a report.
 - **Heuristic, not proof.** The font-charset check infers intent from
   structure. Documents with legitimate unused glyphs may produce findings that
   are not leaks.

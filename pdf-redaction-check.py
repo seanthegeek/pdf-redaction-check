@@ -47,6 +47,7 @@ import string
 import sys
 import unicodedata
 import zlib
+from collections import deque
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from enum import Enum
@@ -54,6 +55,20 @@ from pathlib import Path
 from typing import Literal, NoReturn, NotRequired, TypedDict
 
 import pikepdf
+
+# qpdf's own content-stream parser, which hands one object over at a
+# time. pikepdf's `parse_content_stream` is the documented way in, and
+# it builds a list of every instruction in the stream before the first
+# one can be looked at, which is what makes a content stream a way to
+# spend a machine's memory from a file of a few kilobytes -- see
+# `ContentReader`. This name is not exported at the top level and is not
+# in pikepdf's documentation, so it may move without notice; it has been
+# where it is since pikepdf 8.0, which is the floor pyproject.toml
+# declares. A pikepdf that moves it fails here, at import, rather than
+# part way through reading somebody's document, and there is deliberately
+# nothing to fall back to: falling back to the parser above would put
+# the memory cost back without saying so.
+from pikepdf._core import StreamParser
 
 # Process exit codes. These are public API -- people wire them into
 # pre-send hooks and CI gates -- so the meaning of a code may not change
@@ -72,6 +87,25 @@ EXIT_USAGE = 4
 # nests it forever. Stopping is the defense; stopping quietly is not
 # allowed, so every walk that reaches this limit says where it gave up.
 MAX_DEPTH = 64
+
+# How many operands one drawing instruction is read with. The operands
+# arrive one at a time and are held until the operator that uses them
+# arrives, so a stream that writes nothing but operands would be held
+# whole in memory -- and an operand is a byte or two that compresses to
+# almost nothing, so a file of a few kilobytes could ask for as much
+# memory as the machine has. No operator in ISO 32000 takes more than a
+# handful, and the longest run a producer writes is the dictionary of an
+# inline image, so a limit this far above either is only ever reached by
+# a file built to reach it. Past it the operands written earliest are
+# dropped -- an operator uses the ones written last -- and the drop is
+# reported: text dropped in silence is the one thing this tool may not
+# do.
+#
+# This bounds how many operands are held, not how large one of them is.
+# A single array operand is built whole by the parser before it arrives
+# here, so an array of a million empty strings still costs what it costs
+# to build; the README says so under "Limitations".
+MAX_OPERANDS = 64
 
 # Glyph names that carry no evidential weight when orphaned: whitespace
 # and layout characters legitimately outlive the text that used them.
@@ -1491,6 +1525,23 @@ def unusable_font_note(label: str, count: int) -> str:
     )
 
 
+def undefined_form_note(name: str, count: int) -> str:
+    """Describe a form drawn by a name nothing defines.
+
+    Something was drawn there and nothing here could read it: the `Do`
+    operator names a resource, and the resources in effect where it was
+    written -- a Form XObject's own, where it was written inside one,
+    out to the page's -- define no such thing. What that name would have
+    drawn is not known, which is why the count is of drawings rather
+    than of anything the page showed.
+    """
+    return (
+        f"a form was drawn {count} time(s) as {name}, which the resources in "
+        "effect where it was drawn do not define, so the text it draws was "
+        "not inspected"
+    )
+
+
 @dataclass
 class PageText:
     """What reading one page's drawing instructions has turned up.
@@ -1499,12 +1550,18 @@ class PageText:
     bytes drawn with a font resource nothing defined, by the name the
     document asked for; `unusable` counts the bytes drawn with a name
     that was defined as something other than a font dictionary, by that
-    name; and `unmapped` counts the character codes a font had no
-    mapping for, by font label. All three are counted rather than
-    described one by one, because a font that fails once usually fails
-    for every code it draws. `problems` holds anything else that could
-    not be read, and `stops` the place each chain of forms that went
-    deeper than the walk follows gave up at.
+    name; `unmapped` counts the character codes a font had no mapping
+    for, by font label; and `undefined_forms` counts the drawings of a
+    form by a name nothing defines, by that name. All four are counted
+    rather than described one by one, because a stream that fails once
+    usually fails again and again -- a font that cannot read one
+    character code cannot read the rest, and a name the resources do not
+    define is still not defined the next time something is drawn with
+    it. Counting is also what keeps a stream that draws two million
+    undefined forms, which costs a few kilobytes of file, from costing a
+    line of report each. `problems` holds anything else that could not
+    be read, and `stops` the place each chain of forms that went deeper
+    than the walk follows gave up at.
 
     `drawn` records each form already followed, together with the font
     in effect and the stream that drew it, so that a form drawn twice
@@ -1520,6 +1577,7 @@ class PageText:
     unresolved: dict[str, int] = field(default_factory=dict)
     unusable: dict[str, int] = field(default_factory=dict)
     unmapped: dict[str, int] = field(default_factory=dict)
+    undefined_forms: dict[str, int] = field(default_factory=dict)
     problems: list[str] = field(default_factory=list)
     stops: list[str] = field(default_factory=list)
     drawn: set[FormDrawing] = field(default_factory=set)
@@ -1580,6 +1638,207 @@ def already_drawn(
     return False
 
 
+class ContentReader(StreamParser):
+    """Read the text one content stream draws, as qpdf parses it.
+
+    qpdf hands over one object of the stream at a time -- the operands
+    of an instruction, and then the operator that uses them -- and this
+    puts them back together. Reading a stream that way is the whole
+    point of the class: pikepdf's `parse_content_stream` builds a list
+    of every instruction in the stream before the first one can be
+    looked at, and a `q` is two bytes that compress to almost nothing
+    and cost a few hundred bytes of memory once parsed, so a file of a
+    few kilobytes could ask for as much memory as the machine has.
+    Nothing here holds more than one instruction at a time. That bounds
+    what the number of instructions costs, not what one instruction
+    costs -- see `MAX_OPERANDS`.
+
+    The operands wait for their operator, and no more than
+    `MAX_OPERANDS` of them do: a stream of nothing but operands would
+    otherwise rebuild exactly the list this exists to avoid. Past that
+    many, it is the operands written earliest that are dropped. An
+    instruction is its operands and then the operator that uses them
+    (ISO 32000 section 7.8.2), and an operator takes the operands
+    nearest it, so the ones written last are the ones a reader draws
+    with. The drop is counted and reported, because dropping text in
+    silence is what this tool exists to catch other software doing.
+
+    The font in effect is part of the graphics state that `q` saves and
+    `Q` restores (ISO 32000 section 8.4.2), so those two are tracked
+    here: text drawn after a `Q` is read through the font that was in
+    effect at the matching `q`. A `Q` with nothing left to restore is
+    malformed. Readers leave the graphics state alone when they meet
+    one, and so does this, which leaves the font in effect unchanged. It
+    is reported rather than passed over, because from there on the text
+    is read on the assumption that a reader would do the same.
+
+    The saved states are kept only to the same depth as everything else
+    here, and for the same reason the operands are bounded. Past the
+    limit the state is not kept, and a `Q` that would have taken one
+    back leaves the font where it stands -- the same thing that happens
+    to a `Q` with no `q` at all.
+
+    An inline image can neither be mistaken for text nor throw the
+    grouping out. qpdf writes one as the `BI` operator, the entries of
+    the image's dictionary, `ID`, the image data as a single object of
+    its own, and `EI`. None of those three operators is one this acts
+    on, and the data arrives as an inline image rather than as a string,
+    so an inline image yields no text here -- which is right, because it
+    is a picture.
+    """
+
+    def __init__(
+        self,
+        content: pikepdf.Object | pikepdf.Page,
+        scopes: tuple[pikepdf.Object | None, ...],
+        found: PageText,
+        font: FontState,
+        depth: int,
+    ) -> None:
+        """Set up to read one stream. See `draw_content` for the arguments."""
+        super().__init__()
+        self.content = content
+        self.scopes = scopes
+        self.found = found
+        self.font = font
+        self.depth = depth
+        self.fonts = resource_scope(scopes, "/Font")
+        self.xobjects = resource_scope(scopes, "/XObject")
+        self.decoders: dict[str, FontDecoder] = {}
+        # Bounded by its own length, and from the end an operator uses:
+        # appending to a full deque drops the operand written earliest.
+        self.operands: deque[pikepdf.Object] = deque(maxlen=MAX_OPERANDS)
+        self.saved: list[FontState] = []
+        self.dropped = 0
+        self.unkept = 0
+        self.unkept_restores = 0
+        self.unrestored = 0
+
+    def handle_object(self, obj: pikepdf.Object, offset: int, length: int) -> None:
+        """Take one object of the stream: an operand, or an operator.
+
+        `offset` and `length` say where in the stream the object was
+        written, which nothing here has any use for.
+
+        An operand is anything that is not an operator, and only a
+        pikepdf object carries the type code that tells the two apart:
+        an operand that is a number arrives as a plain Python value, an
+        integer or a Decimal, which carries no such code at all. So the
+        code is asked for rather than reached for, and an object that
+        has none is an operand.
+
+        An operand written when the instruction already holds as many
+        as are read pushes out the one written earliest, which is
+        counted so that the drop can be reported.
+        """
+        if getattr(obj, "_type_code", None) != pikepdf.ObjectType.operator:
+            if len(self.operands) == MAX_OPERANDS:
+                self.dropped += 1
+            self.operands.append(obj)
+            return
+        operands = list(self.operands)
+        self.operands.clear()
+        self.draw(str(obj), operands)
+
+    def handle_eof(self) -> None:
+        """Take the end of the stream.
+
+        Operands written after the last operator belong to no
+        instruction, so they draw nothing and there is nothing left to
+        do with them. The parser calls this whether or not a stream ends
+        that way, and requires it to be here.
+        """
+
+    def draw(self, operator: str, operands: list[pikepdf.Object]) -> None:
+        """Act on one instruction: an operator and what it was given."""
+        if operator == "q":
+            if len(self.saved) < MAX_DEPTH:
+                self.saved.append(self.font)
+            else:
+                self.unkept += 1
+        elif operator == "Q":
+            self.restore()
+        elif operator == "Tf":
+            self.font = select_font(self.fonts, self.decoders, operands)
+        elif operator == "Do":
+            draw_form(
+                self.xobjects,
+                self.scopes,
+                operands,
+                self.found,
+                self.font,
+                self.depth,
+                self.content,
+            )
+        elif operator in SHOW_TEXT_OPERATORS:
+            self.show_text(operands)
+
+    def restore(self) -> None:
+        """Put the font back that the `Q` now being read asks for.
+
+        A Q pairs with the most recent q, kept or not, so the ones that
+        went unkept are counted off first. Taking a state from the stack
+        for one of them would restore a font from the wrong depth and
+        leave every later restore off by one.
+        """
+        if self.unkept:
+            self.unkept -= 1
+            self.unkept_restores += 1
+        elif self.saved:
+            self.font = self.saved.pop()
+        else:
+            self.unrestored += 1
+
+    def show_text(self, operands: list[pikepdf.Object]) -> None:
+        """Read what one show-text instruction draws, through its font."""
+        font = self.font
+        found = self.found
+        for raw in show_text_bytes(operands):
+            if font.decoder is None:
+                counted = found.unusable if font.defined else found.unresolved
+                counted[font.label] = counted.get(font.label, 0) + len(raw)
+                continue
+            text, dropped = font.decoder.decode(raw)
+            found.out.append(text)
+            if dropped:
+                found.unmapped[font.decoder.label] = (
+                    found.unmapped.get(font.decoder.label, 0) + dropped
+                )
+
+    def note_problems(self) -> None:
+        """Record what reading this stream could not work out.
+
+        The counts are what a stream did, not what one instruction did:
+        a stream that gets one of these wrong usually gets it wrong
+        again and again, and one line saying how often is worth more
+        than a thousand saying where.
+        """
+        if self.unrestored:
+            self.found.problems.append(
+                f"{self.unrestored} Q operator(s) had no q left to restore a "
+                "graphics state from, which leaves the font in effect where a "
+                "reader would leave it, so what the text after them spells "
+                "could only be worked out on that assumption"
+            )
+        if self.unkept_restores:
+            self.found.problems.append(
+                f"{self.unkept_restores} Q operator(s) asked for a graphics "
+                f"state saved more than {MAX_DEPTH} q operators deep, which is "
+                "further than this keeps them, so the font in effect was left "
+                "where it stood and the text after them was read on that "
+                "assumption"
+            )
+        if self.dropped:
+            self.found.problems.append(
+                f"{self.dropped} operand(s) were passed over, each of them "
+                f"written to an instruction already holding the "
+                f"{MAX_OPERANDS} operands this reads, which is more than any "
+                "instruction a reader draws with; what is kept is the "
+                "operands written last, because those are the ones an "
+                "operator uses, so any text the others carried was not read"
+            )
+
+
 def draw_content(
     content: pikepdf.Object | pikepdf.Page,
     scopes: tuple[pikepdf.Object | None, ...],
@@ -1600,27 +1859,17 @@ def draw_content(
     out, which is why the font is an argument here rather than kept in
     `found`.
 
-    The font is part of the graphics state that `q` saves and `Q`
-    restores (ISO 32000 section 8.4.2), so those two are tracked here as
-    well: text drawn after a `Q` is read through the font that was in
-    effect at the matching `q`. A form's content is drawn inside a save
-    of its own (section 8.10.1), so the stack starts empty in each call
-    and goes away with it -- neither half of a pair can cross the
-    boundary of a form.
+    A form's content is drawn inside a save of its own (ISO 32000
+    section 8.10.1), so the stack of saved graphics states starts empty
+    in each call and goes away with it -- neither half of a `q` and `Q`
+    pair can cross the boundary of a form. `ContentReader` does the
+    reading, and is where the graphics states and the operands it holds
+    while doing it are bounded.
 
-    A `Q` with nothing left to restore is malformed. Readers leave the
-    graphics state alone when they meet one, and so does this, which
-    leaves the font in effect unchanged. It is reported rather than
-    passed over, because from there on the text is read on the
-    assumption that a reader would do the same.
-
-    The saved states are kept only to the same depth as everything else
-    here. A `q` costs two bytes and asks for a state to be kept, and
-    those two bytes compress to almost nothing, so a file of a few
-    kilobytes could otherwise ask for as much memory as the machine
-    has. Past the limit the state is not kept, and a `Q` that would
-    have taken one back leaves the font where it stands -- the same
-    thing that happens to a `Q` with no `q` at all.
+    A page's drawing instructions and a form's are parsed by two
+    different calls: the first coalesces a /Contents array into one
+    stream, as a reader does, and the second is what parses a stream
+    that is not a page's. Both go to the same parser underneath.
     """
     # `found.drawn` stops a form that draws itself, but only a form that
     # is an object in its own right, which is the only kind a document
@@ -1628,77 +1877,24 @@ def draw_content(
     if depth > MAX_DEPTH:
         found.stops.append(object_label(content))
         return
-    fonts = resource_scope(scopes, "/Font")
-    xobjects = resource_scope(scopes, "/XObject")
-    decoders: dict[str, FontDecoder] = {}
-    saved: list[FontState] = []
-    unkept = 0
-    unkept_restores = 0
-    unrestored = 0
-
-    for instruction in pikepdf.parse_content_stream(content):
-        operator = str(instruction.operator)
-        if operator == "q":
-            if len(saved) < MAX_DEPTH:
-                saved.append(font)
-            else:
-                unkept += 1
-            continue
-        if operator == "Q":
-            # A Q pairs with the most recent q, kept or not, so the ones
-            # that went unkept are counted off first. Taking a state
-            # from the stack for one of them would restore a font from
-            # the wrong depth and leave every later restore off by one.
-            if unkept:
-                unkept -= 1
-                unkept_restores += 1
-            elif saved:
-                font = saved.pop()
-            else:
-                unrestored += 1
-            continue
-        if operator == "Tf":
-            font = select_font(fonts, decoders, instruction.operands)
-            continue
-        if operator == "Do":
-            draw_form(
-                xobjects,
-                scopes,
-                instruction.operands,
-                found,
-                font,
-                depth,
-                content,
-            )
-            continue
-        if operator not in SHOW_TEXT_OPERATORS:
-            continue
-        for raw in show_text_bytes(instruction.operands):
-            if font.decoder is None:
-                counted = found.unusable if font.defined else found.unresolved
-                counted[font.label] = counted.get(font.label, 0) + len(raw)
-                continue
-            text, dropped = font.decoder.decode(raw)
-            found.out.append(text)
-            if dropped:
-                found.unmapped[font.decoder.label] = (
-                    found.unmapped.get(font.decoder.label, 0) + dropped
-                )
-
-    if unrestored:
-        found.problems.append(
-            f"{unrestored} Q operator(s) had no q left to restore a graphics "
-            "state from, which leaves the font in effect where a reader would "
-            "leave it, so what the text after them spells could only be worked "
-            "out on that assumption"
-        )
-    if unkept_restores:
-        found.problems.append(
-            f"{unkept_restores} Q operator(s) asked for a graphics state saved "
-            f"more than {MAX_DEPTH} q operators deep, which is further than "
-            "this keeps them, so the font in effect was left where it stood "
-            "and the text after them was read on that assumption"
-        )
+    reader = ContentReader(content, scopes, found, font, depth)
+    try:
+        if isinstance(content, pikepdf.Page):
+            content.parse_contents(reader)
+        else:
+            # Private, like the parser class itself, and undocumented
+            # for the same reason: pikepdf points a caller at the
+            # list-building parser instead. It takes the stream as an
+            # argument rather than being called on it.
+            pikepdf.Object._parse_stream(content, reader)
+    finally:
+        # What the reader counted before a failure is still worth
+        # saying. `found` is shared with whatever drew this stream, so
+        # a form that fails half way through has already put text in it,
+        # and the caller that reports the failure says the form went
+        # unread -- which is only half of what happened, and the wrong
+        # half to leave standing on its own.
+        reader.note_problems()
 
 
 def draw_form(
@@ -1716,15 +1912,16 @@ def draw_form(
     page, or the form drawing this one -- which `already_drawn` needs to
     tell two drawings of the same form apart.
 
-    Four things stop it going any further. Two are described in
-    `found.problems`, because both are text the page draws that nothing
-    here could read: a name the resources in effect do not define, and a
-    form whose own instructions will not parse -- the second costing the
-    text that one form drew, rather than costing the whole page the way
-    letting the failure out would. Two are silent and ordinary: `Do`
-    naming something that is not a form, which draws no text at all, and
-    a drawing of a form already read, which would only repeat characters
-    already counted.
+    Four things stop it going any further. Two are reported, because
+    both are text the page draws that nothing here could read: a name
+    the resources in effect do not define, which is counted by that name
+    in `found.undefined_forms` and described once however often it is
+    drawn, and a form whose own instructions will not parse -- the
+    second costing the text that one form drew, rather than costing the
+    whole page the way letting the failure out would. Two are silent and
+    ordinary: `Do` naming something that is not a form, which draws no
+    text at all, and a drawing of a form already read, which would only
+    repeat characters already counted.
     """
     for operand in operands:
         if not isinstance(operand, pikepdf.Name):
@@ -1732,11 +1929,7 @@ def draw_form(
         name = str(operand)
         target = xobjects.get(name)
         if target is None:
-            found.problems.append(
-                f"a form was drawn as {name}, which the resources in effect "
-                "where it was drawn do not define, so the text it draws was "
-                "not inspected"
-            )
+            found.undefined_forms[name] = found.undefined_forms.get(name, 0) + 1
             return
         if not is_form_xobject(target):
             return
@@ -1826,6 +2019,10 @@ def _page_text(page: pikepdf.Page) -> tuple[str, list[str], list[str]]:
         "its /ToUnicode CMap nor its /Encoding, so what they spell could not "
         "be worked out"
         for name, count in found.unmapped.items()
+    ]
+    problems += [
+        undefined_form_note(name, count)
+        for name, count in found.undefined_forms.items()
     ]
     return "".join(found.out), problems + found.problems, found.stops
 

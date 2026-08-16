@@ -46,6 +46,7 @@ and safe to paste into a bug report.
     form_xobject.pdf     page text drawn inside a Form XObject
     saved_state.pdf      the font a q saved and a Q put back
     rebound_font.pdf     a form that rebinds the font name the page uses
+    costly_stream.pdf    drawing instructions built to cost more than the file
     deep_nesting.pdf     structures nested deeper than any walk follows
 
 Most of these render identically -- a leak that showed on screen would
@@ -136,6 +137,9 @@ CAPTIONS = {
     "rebound_font.pdf": (
         "Sample rebound_font.pdf - a form rebinds the font name the page uses"
     ),
+    "costly_stream.pdf": (
+        "Sample costly_stream.pdf - instructions that cost more than the file"
+    ),
     "deep_nesting.pdf": "Sample deep_nesting.pdf - nested deeper than a walk follows",
 }
 
@@ -183,6 +187,28 @@ DEEP_FORM_CODES = bytes(range(0xBC, 0xBF))
 # fonts declares: 0xE0 to 0xE2 are the letter a carrying a grave, an
 # acute and a circumflex accent. Nothing reaches these either.
 DEEP_DESCENDANT_CODES = bytes(range(0xE0, 0xE3))
+
+# The two codes the operands of the costly-stream sample's show-text
+# instruction draw, in WinAnsiEncoding: 0xC5 is A with a ring above,
+# 0xD8 is a slashed O. Neither appears anywhere else on that page, so
+# which of the two comes back in the page text says which end of an
+# over-long instruction was kept. The dropped ones are written first,
+# because an operator uses the operands written last.
+KEPT_OPERAND_CODE = b"<C5>"
+DROPPED_OPERAND_CODE = b"<D8>"
+
+# How many operands of each that instruction carries, against a tool
+# that reads 64 of them for one instruction. The kept half fills that
+# exactly and the six in front of it are the ones dropped, so the page
+# text is 64 of one character and none of the other -- a margin an
+# off-by-one at either end cannot account for.
+KEPT_OPERANDS = 64
+DROPPED_OPERANDS = 6
+
+# How often that sample draws a form by a name nothing defines. Any
+# number above one proves the point, which is that a document says this
+# once with a count rather than once per drawing.
+UNDEFINED_DRAWINGS = 500
 
 
 def unique_chars(text: str) -> list[str]:
@@ -1144,6 +1170,44 @@ def name_tree_chain(pdf: pikepdf.Pdf, depth: int, label: str) -> pikepdf.Object:
     return node
 
 
+def build_costly_stream() -> None:
+    """A page whose drawing instructions cost more than the file does.
+
+    Drawing instructions compress extremely well -- an operand can be
+    one byte, and `/Fm0 Do` is seven -- so a file of a few kilobytes
+    holds as many of them as it likes. A tool that held all of one
+    instruction's operands, or wrote a line of report for every drawing
+    of a form nothing defines, would spend a machine's memory on a
+    document that arrived by e-mail.
+
+    Both shapes are here. The page draws one show-text instruction
+    carrying more operands than the tool reads, in the text drawing mode
+    that puts no marks on the page, so the sample still looks like the
+    letter it is; and it draws a form by a name its resources do not
+    define, over and over. A report that says each of those once, with a
+    count, is what this sample is for.
+
+    The two halves of that instruction draw different characters, so the
+    page text says which end of it survived. An operator uses the
+    operands written last, so those are the ones that have to come back
+    -- an instruction read from the wrong end would drop exactly the
+    text a reader puts on the screen.
+    """
+    name = "costly_stream.pdf"
+    letter_pdf(name, CAPTIONS[name], include_secret=False)
+    with pikepdf.open(SAMPLES / name, allow_overwriting_input=True) as pdf:
+        pdf.pages[0].contents_add(
+            pdf.make_stream(
+                b"q BT 3 Tr /F1 12 Tf 72 620 Td "
+                + (DROPPED_OPERAND_CODE + b" ") * DROPPED_OPERANDS
+                + (KEPT_OPERAND_CODE + b" ") * KEPT_OPERANDS
+                + b"Tj ET Q\n"
+                + b"q /Fm0 Do Q\n" * UNDEFINED_DRAWINGS
+            )
+        )
+        pdf.save(SAMPLES / name)
+
+
 def build_deep_nesting() -> None:
     """A document nested deeper than any walk here follows.
 
@@ -1260,6 +1324,7 @@ def main() -> None:
     build_form_xobject()
     build_saved_state()
     build_rebound_font()
+    build_costly_stream()
     build_deep_nesting()
     print(f"wrote {len(CAPTIONS)} sample PDFs to {SAMPLES}")
 
