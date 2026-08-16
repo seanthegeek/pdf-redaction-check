@@ -80,7 +80,12 @@ class TestReportModel:
 
 
 class TestBrokenPages:
-    """A page whose content stream cannot be parsed is skipped."""
+    """A page whose content stream cannot be read yields no text.
+
+    None of these pages yields a character, and none of them ends the
+    run. A page that stops after drawing something keeps what it drew,
+    which is `TestAPageThatStopsPartWayThrough` below.
+    """
 
     def test_unparsable_content_stream(self, prc: ModuleType, tmp_path: Path) -> None:
         path = tmp_path / "broken_stream.pdf"
@@ -89,7 +94,7 @@ class TestBrokenPages:
             page.Contents = pdf.make_stream(b"this is not a content stream (((")
             pdf.save(path)
         with pikepdf.open(path) as pdf:
-            # The page is skipped rather than raising.
+            # Nothing is drawn there, and nothing raises.
             assert prc.extract_page_text(pdf) == ""
 
     def test_a_content_stream_that_will_not_decompress_is_reported(
@@ -124,13 +129,20 @@ class TestBrokenPages:
             pdf.add_blank_page()
             assert prc.extract_page_text(pdf) == ""
 
-    def test_a_raising_page_is_skipped(
+    def test_a_raising_page_yields_no_text(
         self, prc: ModuleType, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        def explode(page):
+        """A page that raises before drawing anything draws nothing.
+
+        The page is not skipped -- it contributes the nothing it drew,
+        and the failure is reported. This is the half of that with
+        nobody listening for the report.
+        """
+
+        def explode(*args: Any) -> None:
             raise pikepdf.PdfError("bad page")
 
-        monkeypatch.setattr(prc, "_page_text", explode)
+        monkeypatch.setattr(prc, "draw_content", explode)
         with pikepdf.new() as pdf:
             pdf.add_blank_page()
             assert prc.extract_page_text(pdf) == ""
@@ -140,10 +152,10 @@ class TestBrokenPages:
     ) -> None:
         """A page nobody could read is not a page with no text on it."""
 
-        def explode(page):
+        def explode(*args: Any) -> None:
             raise pikepdf.PdfError("bad page")
 
-        monkeypatch.setattr(prc, "_page_text", explode)
+        monkeypatch.setattr(prc, "draw_content", explode)
         report = prc.Report(path=Path("x.pdf"))
         with pikepdf.new() as pdf:
             pdf.add_blank_page()
@@ -154,6 +166,245 @@ class TestBrokenPages:
         assert finding.check == prc.CONTENT_STREAM
         assert finding.location == "page 1"
         assert "content stream could not be parsed" in finding.detail
+
+
+class TestAPageThatStopsPartWayThrough:
+    """A page is not thrown away over the part of it that would not read.
+
+    A stream is read as it is parsed, so one that stops half way
+    through has already produced three things worth reporting: the text
+    it decoded, which is in the shared `PageText`; what it counted,
+    which `draw_content` hands back through a `finally`; and the place
+    each chain of forms that went deeper than the walk follows gave up
+    at. A form that stops keeps them, because the failure is caught
+    inside the walk -- see
+    `TestStreamsBuiltToCost.test_what_a_form_dropped_is_said_even_though_it_failed`,
+    which proves it for what a form had counted. The page's own
+    instructions used to lose all three, because the failure was caught
+    outside the function that gathered them, and the text was the
+    expensive loss: page text is what the font-subset check compares a
+    font's characters against, so a font whose text went down with the
+    failure has nothing to account for the characters it declares and
+    is reported as holding the leftovers of a removed passage. A page
+    still showing the text, called a failed redaction.
+
+    What stops a page half way through is this tool's own reading of
+    the document rather than the parser. A stream whose bytes will not
+    decode fails before a single object is handed over, and malformed
+    tokens are recovered from rather than refused, so neither of those
+    leaves a page stopped part way. A font resource that will not read
+    is the shape that raises from inside the walk, and -- as in the
+    form test named above, which stands it in for the same reason --
+    that is what stands in for it here.
+    """
+
+    # What the page draws, as the standard PostScript names of the
+    # characters its font maps codes 1 upwards to. Codes 1 to 3 are
+    # control codes in every base encoding, so what they spell is
+    # decided entirely by that /Differences array -- and the font
+    # declares these three characters and nothing else, so every
+    # character it declares is one the page plainly shows.
+    GLYPH_NAMES = ("Aacute", "Eacute", "Iacute")
+    DRAWN = "ÁÉÍ"
+    DRAWS_THEM = b"BT /F1 12 Tf <010203> Tj ET\n"
+    # A Tf the font behind it will not answer for. What raises is the
+    # reading of the font, so the operator has to be there to raise on.
+    SELECTS_A_BAD_FONT = b"/F1 12 Tf\n"
+
+    def font(self, pdf: pikepdf.Pdf) -> pikepdf.Object:
+        """Return the font that maps codes 1 upwards to `GLYPH_NAMES`."""
+        return pdf.make_indirect(
+            pikepdf.Dictionary(
+                Type=pikepdf.Name("/Font"),
+                Subtype=pikepdf.Name("/Type1"),
+                BaseFont=pikepdf.Name("/Helvetica"),
+                Encoding=pikepdf.Dictionary(
+                    Type=pikepdf.Name("/Encoding"),
+                    Differences=[
+                        1,
+                        *(pikepdf.Name(f"/{name}") for name in self.GLYPH_NAMES),
+                    ],
+                ),
+            )
+        )
+
+    def unreadable_after(
+        self, prc: ModuleType, monkeypatch: pytest.MonkeyPatch, kept: int = 0
+    ) -> None:
+        """Make every Tf after the first `kept` of them raise.
+
+        `kept` is how many font selections read normally first: zero for
+        a page whose only font will not read, one for a page that draws
+        with a font that reads and then selects one that does not.
+        """
+        real = prc.select_font
+        seen = 0
+
+        def guarded(*args: Any) -> Any:
+            nonlocal seen
+            seen += 1
+            if seen > kept:
+                raise ValueError("this font will not read")
+            return real(*args)
+
+        monkeypatch.setattr(prc, "select_font", guarded)
+
+    def form_chain(self, pdf: pikepdf.Pdf, forms: int) -> pikepdf.Object:
+        """Return the outermost of `forms` drawn inside one another.
+
+        Each one draws the next by a name its own /Resources bind to the
+        form below it, so the chain is as deep as it is long.
+        """
+        inner: pikepdf.Object | None = None
+        for _ in range(forms):
+            stream = pdf.make_stream(b"" if inner is None else b"q /Fm Do Q")
+            stream["/Type"] = pikepdf.Name("/XObject")
+            stream["/Subtype"] = pikepdf.Name("/Form")
+            stream["/BBox"] = [0, 0, 10, 10]
+            if inner is not None:
+                stream["/Resources"] = pikepdf.Dictionary(
+                    XObject=pikepdf.Dictionary(Fm=inner)
+                )
+            inner = pdf.make_indirect(stream)
+        assert inner is not None, "a chain of no forms is not a chain"
+        return inner
+
+    def build(self, tmp_path: Path, contents: bytes, forms: int = 0) -> Path:
+        """Write a one-page document drawing `contents`.
+
+        `forms` is how many forms to nest inside one another under the
+        name /Fm0, for the page that reaches the depth limit before it
+        stops; zero leaves the page naming no forms at all.
+
+        The document is written out and read back because that is the
+        path a run takes.
+        """
+        path = tmp_path / "stopped.pdf"
+        with pikepdf.new() as pdf:
+            page = pdf.add_blank_page()
+            resources = pikepdf.Dictionary(Font=pikepdf.Dictionary(F1=self.font(pdf)))
+            if forms:
+                resources["/XObject"] = pikepdf.Dictionary(
+                    Fm0=self.form_chain(pdf, forms)
+                )
+            page.Resources = resources
+            page.Contents = pdf.make_stream(contents)
+            pdf.save(path)
+        return path
+
+    def read(self, prc: ModuleType, path: Path) -> tuple[str, Any]:
+        """Read the page text of the document at `path`, with a report."""
+        report = prc.Report(path=path)
+        with pikepdf.open(path) as pdf:
+            return prc.extract_page_text(pdf, report), report
+
+    def test_the_text_read_before_it_stopped_is_kept(
+        self, prc: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The characters were parsed, decoded, and handed over.
+
+        What the finding says is checked as well as which finding it
+        is, because the two have to match: text drawn before the page
+        stopped was inspected, so a finding claiming otherwise would
+        describe a page this had not read.
+        """
+        path = self.build(tmp_path, self.DRAWS_THEM + self.SELECTS_A_BAD_FONT)
+        self.unreadable_after(prc, monkeypatch, kept=1)
+        text, report = self.read(prc, path)
+        assert text == self.DRAWN
+        assert len(report.findings) == 1
+        finding = report.findings[0]
+        assert finding.severity is prc.Severity.WARNING
+        assert finding.check == prc.CONTENT_STREAM
+        assert finding.location == "page 1"
+        assert "content stream could not be parsed" in finding.detail
+        assert "all the way through" in finding.detail
+        assert "from the point it stopped at" in finding.detail
+
+    def test_a_page_read_to_the_end_says_nothing(
+        self, prc: ModuleType, tmp_path: Path
+    ) -> None:
+        """The control: the same page, with every font readable."""
+        text, report = self.read(prc, self.build(tmp_path, self.DRAWS_THEM))
+        assert text == self.DRAWN
+        assert report.findings == []
+
+    def test_the_font_that_drew_it_is_not_called_a_leftover(
+        self, prc: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The expensive half: a page still showing its text, convicted.
+
+        The font declares exactly the three characters the page draws
+        with it. Losing that text leaves all three unaccounted for, and
+        the font-subset check reports characters nothing on the page
+        accounts for as consistent with text removed from the content
+        stream -- text that is on the page in front of the operator.
+        """
+        path = self.build(tmp_path, self.DRAWS_THEM + self.SELECTS_A_BAD_FONT)
+        self.unreadable_after(prc, monkeypatch, kept=1)
+        report, _ = prc.analyze(path, [])
+        assert [f for f in report.findings if f.check == prc.FONT_CHARSET] == []
+        assert prc.verdict_code(report) == prc.EXIT_SUSPICIOUS
+
+    def test_the_font_is_called_a_leftover_when_the_text_really_is_gone(
+        self, prc: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other half: keeping the text is not quieting the check.
+
+        The same page, stopping at the same point, with the drawing
+        instruction taken out -- so the three characters the font
+        declares really are characters nothing on the page shows. The
+        finding this is meant to leave standing is exactly the one the
+        test above is meant to stop being invented.
+        """
+        path = self.build(tmp_path, self.SELECTS_A_BAD_FONT)
+        self.unreadable_after(prc, monkeypatch)
+        report, _ = prc.analyze(path, [])
+        orphans = [f for f in report.findings if f.check == prc.FONT_CHARSET]
+        assert len(orphans) == 1
+        assert orphans[0].severity is prc.Severity.CRITICAL
+        assert self.DRAWN in orphans[0].detail
+        assert prc.verdict_code(report) == prc.EXIT_RECOVERABLE
+
+    def test_what_the_page_dropped_is_said_even_though_it_stopped(
+        self, prc: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A count taken before the failure is still a count taken.
+
+        The page writes six more operands than one instruction is read
+        with, so six are dropped before the font that will not read
+        stops the reading. A report that mentions only the failure
+        describes a page that dropped nothing.
+        """
+        contents = b"<01> " * (prc.MAX_OPERANDS + 6) + b"Tj\n" + self.SELECTS_A_BAD_FONT
+        path = self.build(tmp_path, contents)
+        self.unreadable_after(prc, monkeypatch)
+        _, report = self.read(prc, path)
+        details = [f.detail for f in report.findings]
+        assert [d for d in details if "6 operand(s)" in d]
+        assert [d for d in details if "content stream could not be parsed" in d]
+
+    def test_a_walk_that_gave_up_before_it_stopped_still_says_so(
+        self, prc: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The third thing lost: forms nested past what the walk follows.
+
+        The chain is two forms longer than the walk goes, so the walk
+        gives up before the font that will not read stops the page.
+        What is below that point is text the page draws and nothing here
+        read, which is the one thing this tool may not pass over in
+        silence.
+        """
+        path = self.build(
+            tmp_path,
+            b"q /Fm0 Do Q\n" + self.SELECTS_A_BAD_FONT,
+            forms=prc.MAX_DEPTH + 2,
+        )
+        self.unreadable_after(prc, monkeypatch)
+        _, report = self.read(prc, path)
+        details = [f.detail for f in report.findings]
+        assert [d for d in details if "nested more than" in d]
+        assert [d for d in details if "content stream could not be parsed" in d]
 
 
 # One line of drawing instructions, for the pages that are meant to be
@@ -947,6 +1198,11 @@ class TestFormXObjects:
 
         This form says it is compressed and is not, so reading its
         instructions fails where reading its bytes does.
+
+        What the finding says is checked here as well as which finding
+        it is: a form and a page that stop part way through are two
+        halves of one bargain, and only text drawn from the point of
+        the failure is text this did not inspect.
         """
         with pikepdf.new() as pdf:
             broken = self.form(pdf, b"BT /F1 12 Tf (inside) Tj ET")
@@ -962,6 +1218,8 @@ class TestFormXObjects:
         assert finding.check == prc.CONTENT_STREAM
         assert finding.location == "page 1"
         assert "the form drawn as /Fm0 could not be parsed" in finding.detail
+        assert "all the way through" in finding.detail
+        assert "from the point it stopped at" in finding.detail
 
     def test_an_image_drawn_by_the_same_operator_holds_no_text(
         self, prc: ModuleType
@@ -1363,6 +1621,27 @@ class TestStreamsBuiltToCost:
         )
         assert text == "a" * prc.MAX_OPERANDS
         assert problems == []
+
+    def test_a_stream_of_nothing_but_operands_says_what_it_dropped(
+        self, prc: ModuleType
+    ) -> None:
+        """The drop is counted in a stream that writes no operator at all.
+
+        This is the stream the bound exists for, and no instruction is
+        written anywhere in it: every operand here is waiting for an
+        operator that never arrives, so none of them belongs to an
+        instruction. The ones still waiting at the end draw nothing and
+        are not reported -- `handle_eof` says why -- but the ones pushed
+        out to make room for them are, and what is said about those has
+        to describe operands waiting for an operator. Describing them as
+        written to an instruction that already holds as many as are read
+        asserts an instruction this stream never wrote.
+        """
+        text, problems, _ = self.read(prc, b"<01> " * (prc.MAX_OPERANDS + 6))
+        assert text == ""
+        assert len(problems) == 1
+        assert "6 operand(s)" in problems[0]
+        assert "waiting for an operator" in problems[0]
 
     def test_operands_are_counted_for_the_instruction_they_belong_to(
         self, prc: ModuleType

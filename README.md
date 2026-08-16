@@ -179,23 +179,25 @@ outside the text layer reports under two names: `raw-objects` for stream data,
 
 - `raw-objects`: a stream whose declared filters could not be undone and that
   holds no picture, or that cannot be read at all;
-- `content-stream`: a page whose drawing instructions will not parse; a page
-  whose `/Contents` is neither a content stream nor an array of them, or an
-  entry of that array that is not a content stream, either of which a parser
-  hands back no instructions for rather than refusing; a form drawn on the page
-  that will not parse, or that is drawn by a name nothing defines; forms drawn
-  inside one another more than 64 levels deep, which is where every walk here
-  stops — see "Limitations"; text drawn before any font was selected, with a
-  font the resources in effect do not define, with a name they define as
-  something other than a font dictionary, or with a character code that font
-  does not map; a `Q` operator with no `q` left to restore a graphics state
-  from, or one asking for a state saved more than 64 `q` operators deep, which
-  is as many as are kept, after either of which the text is read on the
-  assumption that a reader would leave the font where it stands; or an
-  instruction written with more than the 64 operands this reads — see
-  "Limitations" — which is more than any instruction a reader draws with, so
-  the ones written first were passed over and the ones written last, which are
-  the ones an operator uses, were kept;
+- `content-stream`: a page whose drawing instructions will not parse all the
+  way through, or a form drawn on the page whose own will not — either of which
+  costs the text drawn from the point they stopped at and not the text drawn
+  before it; a page whose `/Contents` is neither a content stream nor an array
+  of them, or an entry of that array that is not a content stream, either of
+  which a parser hands back no instructions for rather than refusing; a form
+  drawn by a name nothing defines; forms drawn inside one another more than 64
+  levels deep, which is where every walk here stops — see "Limitations"; text
+  drawn before any font was selected, with a font the resources in effect do not
+  define, with a name they define as something other than a font dictionary, or
+  with a character code that font does not map; a `Q` operator with no `q` left
+  to restore a graphics state from, or one asking for a state saved more than
+  64 `q` operators deep, which is as many as are kept, after either of which
+  the text is read on the assumption that a reader would leave the font where
+  it stands; or more operands written in a row than the 64 this holds waiting
+  for an operator — see "Limitations" — which is more operands than any
+  instruction a reader draws with, so the ones written first were passed over
+  and the ones written last, which are the ones an operator would use, were
+  kept;
 - `font-charset`: a font whose character map, `/Widths` array, or `/FirstChar`
   cannot be read, a `/DescendantFonts` entry that is not an array or that holds
   something other than a font dictionary, a `/Font` resource that is not a font
@@ -437,9 +439,9 @@ file is clean.
   than to what it asks for. The instructions are read one at a time rather than
   all at once, so how many of them a page holds no longer decides what reading
   it costs. Two things are bounded on top of that, and each says so when it is
-  reached: an instruction is read with at most 64 operands — the ones written
-  last, because those are the ones an operator uses — and at most 64 saved
-  graphics states are kept for `q` and `Q` to restore the font from. Both
+  reached: at most 64 operands are held waiting for an operator — the ones
+  written last, because those are the ones an operator uses — and at most 64
+  saved graphics states are kept for `q` and `Q` to restore the font from. Both
   limits are far above anything a producer writes, the longest run of operands
   on an ordinary page being the dictionary of an inline image, so reaching
   either is a fact about the file rather than about the document. What none of

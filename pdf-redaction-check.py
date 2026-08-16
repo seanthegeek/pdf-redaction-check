@@ -1727,9 +1727,9 @@ class ContentReader(StreamParser):
         code is asked for rather than reached for, and an object that
         has none is an operand.
 
-        An operand written when the instruction already holds as many
-        as are read pushes out the one written earliest, which is
-        counted so that the drop can be reported.
+        An operand written when as many are already waiting for an
+        operator as this holds pushes out the one written earliest,
+        which is counted so that the drop can be reported.
         """
         if getattr(obj, "_type_code", None) != pikepdf.ObjectType.operator:
             if len(self.operands) == MAX_OPERANDS:
@@ -1831,11 +1831,11 @@ class ContentReader(StreamParser):
         if self.dropped:
             self.found.problems.append(
                 f"{self.dropped} operand(s) were passed over, each of them "
-                f"written to an instruction already holding the "
-                f"{MAX_OPERANDS} operands this reads, which is more than any "
-                "instruction a reader draws with; what is kept is the "
-                "operands written last, because those are the ones an "
-                "operator uses, so any text the others carried was not read"
+                f"written when {MAX_OPERANDS} were already waiting for an "
+                "operator, which is more operands than any instruction a "
+                "reader draws with; what is kept is the operands written "
+                "last, because those are the ones an operator would use, so "
+                "any text the others carried was not read"
             )
 
 
@@ -1889,11 +1889,14 @@ def draw_content(
             pikepdf.Object._parse_stream(content, reader)
     finally:
         # What the reader counted before a failure is still worth
-        # saying. `found` is shared with whatever drew this stream, so
-        # a form that fails half way through has already put text in it,
-        # and the caller that reports the failure says the form went
-        # unread -- which is only half of what happened, and the wrong
-        # half to leave standing on its own.
+        # saying, and the counts live on the reader rather than in
+        # `found`, so this is what carries them over when a stream stops
+        # part way through. The text needs no such help -- it goes into
+        # `found` as it is read, and `found` belongs to whatever drew
+        # this stream. Either way the caller that reports the failure
+        # says only what went unread from the point it stopped at, which
+        # is half of what happened and the wrong half to leave standing
+        # on its own.
         reader.note_problems()
 
 
@@ -1917,11 +1920,14 @@ def draw_form(
     the resources in effect do not define, which is counted by that name
     in `found.undefined_forms` and described once however often it is
     drawn, and a form whose own instructions will not parse -- the
-    second costing the text that one form drew, rather than costing the
-    whole page the way letting the failure out would. Two are silent and
-    ordinary: `Do` naming something that is not a form, which draws no
-    text at all, and a drawing of a form already read, which would only
-    repeat characters already counted.
+    second costing the text that form had left to draw, rather than
+    costing the rest of the page the way letting the failure out would.
+    What the form drew before it stopped is in `found` already and stays
+    there, which is the same bargain `_page_text` makes for the page's
+    own instructions. Two are silent and ordinary: `Do` naming something
+    that is not a form, which draws no text at all, and a drawing of a
+    form already read, which would only repeat characters already
+    counted.
     """
     for operand in operands:
         if not isinstance(operand, pikepdf.Name):
@@ -1945,8 +1951,9 @@ def draw_form(
             )
         except UNPARSABLE_CONTENT as exc:
             found.problems.append(
-                f"the form drawn as {name} could not be parsed, so the text "
-                f"it draws was not inspected: {exc}"
+                f"the form drawn as {name} could not be parsed all the way "
+                "through, so the text it draws from the point it stopped at "
+                f"was not inspected: {exc}"
             )
         return
 
@@ -1965,8 +1972,8 @@ def content_problems(page: pikepdf.Page) -> list[str]:
     not a stream the same way. Either one reads exactly like a page that
     draws nothing, so what the parser passes over in silence is said
     here. (The same page of a document still being built in memory
-    raises instead, which `extract_page_text` reports as a content
-    stream it could not parse.)
+    raises instead, which `_page_text` reports as a content stream it
+    could not parse all the way through.)
     """
     contents = page.get("/Contents")
     if contents is None or isinstance(contents, pikepdf.Stream):
@@ -2000,13 +2007,31 @@ def _page_text(page: pikepdf.Page) -> tuple[str, list[str], list[str]]:
     forms that went deeper than the walk follows gave up at, which the
     caller reports as one finding rather than one per branch.
 
+    Instructions that will not parse end the reading rather than the
+    page. A stream is read as it is parsed, so one that stops part way
+    through has already produced text this decoded, counts this took,
+    and chains of forms this gave up on -- and page text is what the
+    font-subset check compares a font's characters against, so throwing
+    the page away because its instructions stopped leaves its fonts
+    reported as holding the leftovers of a passage the page is still
+    showing. What was read is returned, and the failure is described
+    among the problems: the same bargain `draw_form` makes for a form
+    that stops part way through.
+
     A /Contents entry that is not drawing instructions is not described
-    here. That reading has to survive this raising, so the caller makes
-    it; see `content_problems`.
+    here: that is a reading of the entry rather than of the instructions
+    in it, and the caller makes it; see `content_problems`.
     """
     found = PageText()
     problems: list[str] = []
-    draw_content(page, (page_resources(page),), found)
+    try:
+        draw_content(page, (page_resources(page),), found)
+    except UNPARSABLE_CONTENT as exc:
+        problems.append(
+            "the page content stream could not be parsed all the way "
+            "through, so the text it draws from the point it stopped at was "
+            f"not inspected: {exc}"
+        )
 
     problems += [
         undecoded_note(name, count) for name, count in found.unresolved.items()
@@ -2049,17 +2074,9 @@ def extract_page_text(pdf: pikepdf.Pdf, report: Report | None = None) -> str:
         # an entry of it that nobody could read is still worth saying
         # when reading the rest of it fails as well.
         problems = content_problems(page)
-        stops: list[str] = []
-        try:
-            text, decoded, stops = _page_text(page)
-        except UNPARSABLE_CONTENT as exc:
-            problems.append(
-                "the page content stream could not be parsed, so the "
-                f"text it draws was not inspected: {exc}"
-            )
-        else:
-            chunks.append(text)
-            problems += decoded
+        text, decoded, stops = _page_text(page)
+        chunks.append(text)
+        problems += decoded
         if report is not None:
             for problem in problems:
                 report.add(Severity.WARNING, CONTENT_STREAM, problem, f"page {index}")

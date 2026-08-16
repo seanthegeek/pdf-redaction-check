@@ -30,18 +30,32 @@ bump.
   costs. Instructions compress extremely well — a `q` is two bytes — so a
   four-kilobyte page holding two million of them used to cost about 590 MB to
   read, and now costs about 40 MB whatever the count. Grouping the operands
-  with their operator is now this tool's own job, so it bounds them: an
-  instruction is read with at most 64 of them, the ones written last, because
-  those are the ones an operator uses, and an instruction that carried more
-  says so rather than passing over what was dropped. Ordinary documents are
-  nowhere near that limit. What is still not bounded is the size of one
-  operand, which the README now says under "Limitations".
+  with their operator is now this tool's own job, so it bounds them: at most 64
+  of them are held waiting for an operator, and it is the ones written last that
+  are kept, because those are the ones an operator uses. A stream that writes
+  more in a row than that says so rather than passing over what was dropped.
+  Ordinary documents are nowhere near that limit. What is still not bounded is
+  the size of one operand, which the README now says under "Limitations".
+- A page whose drawing instructions stop part way through now keeps what was
+  read before they stopped, instead of losing the page along with the rest of
+  the stream. A stream is read as it is parsed, so one that stops has already
+  produced text, has already counted what it passed over, and may already have
+  given up on a chain of forms nested deeper than any walk follows; all three
+  used to go down with the failure, and the page was reported only as a content
+  stream nobody could read. The text was the expensive loss, because page text
+  is what the font-subset check compares a font's characters against: a font
+  whose text went down with the failure had nothing left to account for the
+  characters it declares, and was reported as holding the leftovers of a removed
+  passage — a page still showing its text, called a failed redaction. A form
+  that stops part way through has always kept all three, and the two now agree,
+  in what they keep and in how they describe what was missed.
 - A form drawn by a name nothing defines is now described once, with a count of
   how often it was drawn, instead of once for every drawing. That changes the
   wording of an existing warning, and it took a page of a few tens of kilobytes
   that draws two million such forms from about 1.7 GB to about 60 MB. What a
-  stream had already counted is also reported when reading it fails part way
-  through, rather than going down with the failure.
+  form had already counted is also reported when reading it fails part way
+  through, rather than going down with the failure; the bullet above is where
+  the page's own instructions caught up with that.
 - Page text is now read through the font a `Q` puts back. The font is part of
   the graphics state that `q` saves and `Q` restores, and ordinary producers
   wrap blocks of drawing in the pair, so ignoring it read the text after a `Q`
