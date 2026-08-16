@@ -1,6 +1,9 @@
 {
     "markdownlint.config": {
-        "MD024": false
+        "MD024": false,
+        "MD013": {
+            "code_blocks": false
+        }
     },
     "cSpell.words": [
         "Acro",
@@ -12,6 +15,7 @@
         "begincodespacerange",
         "bfchar",
         "bfrange",
+        "CCITT",
         "CIDFont",
         "CMap",
         "CMaps",
@@ -25,19 +29,26 @@
         "endcmap",
         "endcodespacerange",
         "findresource",
+        "Ghostscript",
         "hatchling",
+        "JBIG",
+        "keepachangelog",
         "notaglyphname",
         "objgen",
+        "opensource",
         "pagesizes",
         "pathlib",
         "pdfgen",
         "pdftotext",
         "pikepdf",
+        "pipx",
         "pypa",
         "pypi",
         "pytest",
+        "redactions",
         "reportlab",
         "sdist",
+        "semver",
         "smoketest",
         "srcbuilds",
         "testpaths",

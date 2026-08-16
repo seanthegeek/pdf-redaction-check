@@ -13,4 +13,4 @@ build/
 dist/
 
 # The sample PDFs in tests/samples are committed on purpose -- they are
-# the test corpus. Rebuild them with `python make-tests.py`.
+# the test corpus. Rebuild them with `python make-test-samples.py`.

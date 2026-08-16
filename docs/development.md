@@ -1,7 +1,7 @@
 # Development
 
-Instructions for improving `pdf-redaction-check` itself. For what the tool does and how to use
-it, see the [README](../README.md).
+Instructions for improving `pdf-redaction-check` itself. For what the tool does
+and how to use it, see the [README](../README.md).
 
 `./build.sh` creates `.venv` if it does not already exist, installs the runtime
 and development dependencies into it, and builds the sdist and wheel into
@@ -28,8 +28,8 @@ rename makes an editable install a stale copy rather than a live link.
 
 ## Continuous integration
 
-[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) runs on every push and
-pull request:
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) runs on every pull
+request and on every push to `main`:
 
 | Job | What it does |
 | --- | ------------ |
@@ -38,11 +38,13 @@ pull request:
 | Lint | `ruff check`, `ruff format --check`, `pyright`, markdownlint |
 | Build | sdist and wheel, `twine check`, then installs and runs the command |
 
-The commands are the ones above, so a green local run means a green CI run.
-Coverage is measured with branches enabled and currently sits at 100% for both
-`pdf-redaction-check.py` and `make-test-samples.py`; the gate is enforced on a
-single Python version, because which lines are reachable can differ between
-interpreters.
+The commands mirror the ones above, so a green local run is a strong predictor
+— but CI additionally runs the tests on every supported Python version, and its
+build job installs the wheel into a fresh environment to prove the console
+script runs. Coverage is measured with branches enabled and currently sits at
+100% for both `pdf-redaction-check.py` and `make-test-samples.py`; the gate is
+enforced on a single Python version, because which lines are reachable can
+differ between interpreters.
 
 The build job installs the wheel and runs the console script against a sample
 on purpose: the hyphenated filename is renamed on the way into the wheel, and
@@ -54,8 +56,13 @@ run.
 [`.github/workflows/release.yml`](../.github/workflows/release.yml) publishes to
 PyPI when a GitHub release is published. To cut one:
 
-1. Bump `version` in `pyproject.toml` and commit it.
-2. Tag with a `v` prefix and publish a GitHub release for that tag.
+1. Move the accumulated `## [Unreleased]` entries in
+   [`CHANGELOG.md`](../CHANGELOG.md) under a new heading for the version, dated
+   the day you are releasing, and update the link definitions at the foot of the
+   file.
+2. Bump `version` in `pyproject.toml` to match, and commit both together.
+3. Tag with a `v` prefix and publish a GitHub release for that tag. The release
+   notes are the changelog entry.
 
 The workflow builds, refuses to continue if the tag disagrees with the packaged
 version, installs the wheel and runs the command, publishes, and finally
@@ -99,9 +106,9 @@ view of the repository.
 ## Test samples
 
 The sample PDFs in [tests/samples/](../tests/samples/) are committed, one per
-failure mode. The tests read them directly, so a test run is deterministic and
-does not need reportlab — a freshly generated PDF carries a new `CreationDate`
-every time, which would make results drift.
+failure mode. The tests read them directly, so a test run is deterministic — a
+freshly generated PDF carries a new `CreationDate` every time, which would make
+results drift.
 
 `make-test-samples.py` rebuilds them. Run it by hand after changing or adding a
 fixture, and commit the result:
@@ -109,6 +116,14 @@ fixture, and commit the result:
 ```bash
 python make-test-samples.py   # rewrites tests/samples/
 ```
+
+[`tests/test_generator.py`](../tests/test_generator.py) is the one test that
+runs the generator rather than reading the committed files. It rebuilds the
+corpus into a temporary directory and compares what the tool finds in each copy,
+because otherwise nothing would notice the generator being edited without the
+samples being regenerated — the binaries would quietly stop matching the code
+that claims to produce them. That test is why reportlab is a development
+dependency and has to be installed to run `pytest`.
 
 Keeping the generator next to the binaries is deliberate: a committed PDF in a
 security tool should never be a blob nobody can reproduce or audit. Every

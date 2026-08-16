@@ -3,7 +3,10 @@
   // editor and CI agree. MD024 allows the repeated headings a Keep a
   // Changelog file needs.
   "config": {
-    "MD024": false
+    "MD024": false,
+    // Code blocks quote real terminal output and JSON. Reflowing a line to
+    // fit 80 columns would misrepresent what the tool actually prints.
+    "MD013": { "code_blocks": false }
   },
   "globs": [
     "**/*.md"

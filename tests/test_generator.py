@@ -25,7 +25,9 @@ SECRET = "742 Evergreen Terrace"
 
 
 @pytest.fixture
-def rebuilt(maketests: ModuleType, tmp_path: Path, monkeypatch) -> Path:
+def rebuilt(
+    maketests: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
     """Regenerate every sample into a temporary directory."""
     monkeypatch.setattr(maketests, "SAMPLES", tmp_path)
     maketests.main()
@@ -58,7 +60,7 @@ def test_generator_writes_every_expected_sample(rebuilt: Path) -> None:
 
 
 def test_generator_creates_its_output_directory(
-    maketests: ModuleType, tmp_path: Path, monkeypatch
+    maketests: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     target = tmp_path / "brand" / "new"
     monkeypatch.setattr(maketests, "SAMPLES", target)
@@ -82,6 +84,20 @@ def test_page_text_matches_what_the_page_actually_draws(
     )
     assert drawn == expected
     assert maketests.SECRET not in expected
+
+
+def test_page_text_includes_the_extra_body_line(
+    prc: ModuleType, maketests: ModuleType, fixtures: Path
+) -> None:
+    """The same invariant, for the page that carries a fourth line."""
+    _, extracts = prc.analyze(fixtures / "smart_quotes.pdf", [], want_extracts=True)
+    drawn = next(e.text for e in extracts if e.layer == prc.CONTENT_STREAM)
+    expected = maketests.page_text(
+        maketests.CAPTIONS["smart_quotes.pdf"],
+        include_secret=False,
+        extra=maketests.SMART_QUOTES,
+    )
+    assert drawn == expected
 
 
 def test_page_text_adds_the_secret_when_asked(maketests: ModuleType) -> None:

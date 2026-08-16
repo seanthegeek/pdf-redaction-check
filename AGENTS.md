@@ -24,8 +24,9 @@ may imply otherwise.
 
 - `pdf-redaction-check.py` — the entire tool: checks, report model, and CLI
 - `tests/samples/` — the committed sample PDFs, one per failure mode
-- `make-test-samples.py` — rebuilds `tests/samples/`; run by hand, never by the
-  tests
+- `make-test-samples.py` — rebuilds `tests/samples/`; run by hand when a fixture
+  changes. `tests/test_generator.py` is the one place that runs it from the
+  suite, and only to prove the committed binaries still match it
 - `pyproject.toml` — hatchling build, pytest and coverage config; installs the
   `pdf-redaction-check` command
 - `build.sh` — creates `.venv` if absent, then builds the sdist and wheel into
@@ -35,6 +36,8 @@ may imply otherwise.
   published; manual runs go to TestPyPI
 - `.vscode/tasks.json` — makes `build.sh` the default VSCode build task
 - `README.md` — user-facing overview, usage, and limitations
+- `CHANGELOG.md` — Keep a Changelog format; updated in the same commit that
+  bumps the version
 - `docs/development.md` — building, testing, CI, releasing, and test samples
 
 **Script filenames in this repo are hyphenated, by preference.** A hyphen is not
@@ -205,11 +208,16 @@ someone's address is still in a document.
   report. Never add a fixture built from a real document, a real person's
   details, or a redacted file someone sent you.
 - **The sample PDFs in `tests/samples/` are committed, and `make-test-samples.py`
-  rebuilds them.** Tests read the committed files, so runs are deterministic and
-  do not need reportlab. Changing a fixture means running `python make-test-samples.py`
-  and committing both the generator change and the regenerated PDF — never one
-  without the other, or the binary stops matching the code that claims to
-  produce it.
+  rebuilds them.** Tests read the committed files, so runs are deterministic.
+  Changing a fixture means running `python make-test-samples.py` and committing
+  both the generator change and the regenerated PDF — never one without the
+  other, or the binary stops matching the code that claims to produce it.
+  `tests/test_generator.py` is the sanctioned exception to reading the committed
+  files: it rebuilds the corpus into a temporary directory and compares what the
+  tool finds in each copy, which is what catches a generator edited without the
+  samples being regenerated. That test is why reportlab is a development
+  dependency and why the suite needs it installed — the coverage gate covers
+  `make-test-samples.py` too.
 - **Every check needs a fixture that fails without it.** A new detection layer
   ships with a builder in `make-test-samples.py`, the regenerated sample, and a
   test asserting the check fires on it — plus confirmation that `clean.pdf` still
