@@ -1777,6 +1777,49 @@ class TestAttachmentEdges:
         )
         assert list(prc._iter_embedded_files(tree)) == [("empty.txt", None)]
 
+    def test_the_unicode_file_entry_is_read_when_there_is_no_other(
+        self, prc: ModuleType
+    ) -> None:
+        """A file specification may carry /UF instead of /F.
+
+        Asking which one is there has to be a question about the type.
+        Older pikepdf refuses to say whether a stream is truthy at all,
+        so choosing between the two with `or` raised instead of picking
+        one, and every attachment went unmeasured.
+        """
+        with pikepdf.new() as pdf:
+            tree = pikepdf.Dictionary(
+                Names=[
+                    pikepdf.String("only-uf.txt"),
+                    pikepdf.Dictionary(
+                        EF=pikepdf.Dictionary(UF=pdf.make_stream(b"four"))
+                    ),
+                ]
+            )
+            assert list(prc._iter_embedded_files(tree)) == [("only-uf.txt", 4)]
+
+    def test_the_plain_file_entry_wins_when_both_are_there(
+        self, prc: ModuleType
+    ) -> None:
+        """The negative half: /UF is the fallback, not the preference.
+
+        Without this, reading /UF first would look the same on every
+        file that carries only one of them, which is most of them.
+        """
+        with pikepdf.new() as pdf:
+            tree = pikepdf.Dictionary(
+                Names=[
+                    pikepdf.String("both.txt"),
+                    pikepdf.Dictionary(
+                        EF=pikepdf.Dictionary(
+                            F=pdf.make_stream(b"seven!!"),
+                            UF=pdf.make_stream(b"four"),
+                        )
+                    ),
+                ]
+            )
+            assert list(prc._iter_embedded_files(tree)) == [("both.txt", 7)]
+
     def test_unreadable_attachment_reports_no_size(
         self, prc: ModuleType, monkeypatch: pytest.MonkeyPatch
     ) -> None:

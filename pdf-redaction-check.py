@@ -2278,7 +2278,13 @@ def _iter_embedded_files(
         if isinstance(spec, pikepdf.Dictionary):
             embedded = spec.get("/EF")
             if isinstance(embedded, pikepdf.Dictionary):
-                stream = embedded.get("/F") or embedded.get("/UF")
+                # Asking whether a pikepdf object is truthy is not the
+                # same question as asking whether it is there: older
+                # pikepdf raises rather than answer it for a stream.
+                # The type is what this wants to know anyway.
+                stream = embedded.get("/F")
+                if not isinstance(stream, pikepdf.Stream):
+                    stream = embedded.get("/UF")
                 if isinstance(stream, pikepdf.Stream):
                     try:
                         size = len(stream.read_bytes())
