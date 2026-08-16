@@ -42,8 +42,10 @@ and safe to paste into a bug report.
     lying_image.pdf      compressed text under the name of an image filter
     smart_quotes.pdf     WinAnsi curly quotes, and nothing hidden
     broken_fonts.pdf     font dictionaries that cannot be read
+    broken_contents.pdf  drawing instructions that are not a content stream
     form_xobject.pdf     page text drawn inside a Form XObject
     saved_state.pdf      the font a q saved and a Q put back
+    rebound_font.pdf     a form that rebinds the font name the page uses
     deep_nesting.pdf     structures nested deeper than any walk follows
 
 Most of these render identically -- a leak that showed on screen would
@@ -126,8 +128,14 @@ CAPTIONS = {
     ),
     "smart_quotes.pdf": "Sample smart_quotes.pdf - curly quotes, nothing hidden",
     "broken_fonts.pdf": "Sample broken_fonts.pdf - font dictionaries that misbehave",
+    "broken_contents.pdf": (
+        "Sample broken_contents.pdf - drawing instructions that are not a stream"
+    ),
     "form_xobject.pdf": "Sample form_xobject.pdf - text drawn inside a Form XObject",
     "saved_state.pdf": "Sample saved_state.pdf - a Q puts back the font a q saved",
+    "rebound_font.pdf": (
+        "Sample rebound_font.pdf - a form rebinds the font name the page uses"
+    ),
     "deep_nesting.pdf": "Sample deep_nesting.pdf - nested deeper than a walk follows",
 }
 
@@ -152,6 +160,15 @@ INNER_FORM_CODES = bytes(range(0xB5, 0xB7))
 KEPT_GLYPH_NAMES = ("Aacute", "Eacute", "Iacute")
 DROPPED_GLYPH_NAMES = ("Ograve", "Ugrave", "Ydieresis", "Zcaron")
 
+# The two fonts of the rebound-name sample, again as standard PostScript
+# glyph names, and again characters that appear nowhere else on the
+# page. Both fonts are named /FRebound: one in the page's resources, one
+# in the resources of the form the page draws. Each declares exactly the
+# three characters it draws, so a correct reading leaves neither of them
+# with a character to account for.
+PAGE_FONT_GLYPH_NAMES = ("Thorn", "Eth", "Scaron")
+FORM_FONT_GLYPH_NAMES = ("Yacute", "Zcaron", "Oslash")
+
 # How deep the deep-nesting sample nests, against a tool that follows 64
 # levels. Deeper than the limit by enough that an off-by-one in either
 # place cannot be what the sample is testing.
@@ -161,6 +178,11 @@ NESTING_DEPTH = 70
 # 0xBC to 0xBE are the three vulgar fractions. Nothing reaches them,
 # which is the point of the sample.
 DEEP_FORM_CODES = bytes(range(0xBC, 0xBF))
+
+# The codes the font at the bottom of that sample's chain of descendant
+# fonts declares: 0xE0 to 0xE2 are the letter a carrying a grave, an
+# acute and a circumflex accent. Nothing reaches these either.
+DEEP_DESCENDANT_CODES = bytes(range(0xE0, 0xE3))
 
 
 def unique_chars(text: str) -> list[str]:
@@ -868,6 +890,31 @@ def build_broken_fonts() -> None:
         pdf.save(SAMPLES / name)
 
 
+def build_broken_contents() -> None:
+    """A document whose drawing instructions are not drawing instructions.
+
+    A page's /Contents is a content stream, or an array of them that a
+    reader treats as one (ISO 32000 Table 30). pikepdf's content parser
+    hands back no instructions at all for a page whose /Contents is a
+    number, and passes over an array entry that is not a stream, so
+    either one reads exactly like a page that draws nothing -- and a
+    document whose text nobody could read then comes back clean.
+
+    One page per shape. Page 1 keeps the instructions that draw the
+    letter and adds a number to the array beside them, so the caption
+    still renders while an entry of the array goes unread. Page 2's
+    /Contents is a number outright, which is why it is blank.
+    """
+    name = "broken_contents.pdf"
+    letter_pdf(name, CAPTIONS[name], include_secret=False)
+    with pikepdf.open(SAMPLES / name, allow_overwriting_input=True) as pdf:
+        page = pdf.pages[0]
+        page["/Contents"] = pikepdf.Array([page["/Contents"], 42])
+        blank = pdf.add_blank_page()
+        blank.obj["/Contents"] = 42
+        pdf.save(SAMPLES / name)
+
+
 def widths_font(first: int, count: int) -> pikepdf.Dictionary:
     """Return a font dictionary declaring `count` consecutive codes.
 
@@ -1001,6 +1048,102 @@ def build_saved_state() -> None:
         pdf.save(SAMPLES / name)
 
 
+def build_rebound_font() -> None:
+    """A form that defines the font name the page is already using.
+
+    Nothing stops a Form XObject carrying resources that give a name the
+    page also uses to a different font. This one does: the page selects
+    /FRebound and draws the form, and inside it the form selects
+    /FRebound of its own -- another font entirely -- inside a q ... Q
+    pair, drawing a second form through it. After the Q, with the page's
+    /FRebound back in effect, it draws that same second form again.
+
+    Both drawings are one form under one resource name, so a reader of
+    this that tells drawings apart by the name alone treats the second
+    as a repeat of the first and skips it. That loses three characters
+    the page really did put on the screen -- and the page's own font,
+    the only thing that declares them, is then reported as carrying the
+    leftovers of a removed passage. Each font here declares exactly the
+    characters it draws, so nothing is left over and a correct reading
+    produces no font finding at all.
+    """
+    name = "rebound_font.pdf"
+    letter_pdf(name, CAPTIONS[name], include_secret=False)
+    with pikepdf.open(SAMPLES / name, allow_overwriting_input=True) as pdf:
+        page = pdf.pages[0]
+        inner = form(pdf, b"BT 0 g 72 580 Td <010203> Tj ET\n", None)
+        page["/Resources"]["/Font"]["/FRebound"] = pdf.make_indirect(
+            differences_font(PAGE_FONT_GLYPH_NAMES)
+        )
+        page["/Resources"]["/XObject"] = pikepdf.Dictionary(
+            Fm0=form(
+                pdf,
+                # The second drawing is shifted down the page so that the
+                # two do not land on top of one another.
+                b"q /FRebound 12 Tf /FmInner Do Q\nq 1 0 0 1 0 -20 cm /FmInner Do Q\n",
+                pikepdf.Dictionary(
+                    Font=pikepdf.Dictionary(
+                        FRebound=pdf.make_indirect(
+                            differences_font(FORM_FONT_GLYPH_NAMES)
+                        )
+                    ),
+                    XObject=pikepdf.Dictionary(FmInner=inner),
+                ),
+            )
+        )
+        page.contents_add(pdf.make_stream(b"q /FRebound 12 Tf /Fm0 Do Q\n"))
+        pdf.save(SAMPLES / name)
+
+
+def descendant_chain(pdf: pikepdf.Pdf, depth: int) -> pikepdf.Object:
+    """Return a composite font `depth` descendant fonts above the bottom.
+
+    A composite font declares its characters through the descendant font
+    it lists, which is a font in its own right and may list a descendant
+    of its own. Only the font at the bottom of the chain declares
+    anything; every font above it is there to be walked through.
+    """
+    font = pdf.make_indirect(
+        widths_font(DEEP_DESCENDANT_CODES[0], len(DEEP_DESCENDANT_CODES))
+    )
+    for _ in range(depth):
+        font = pdf.make_indirect(
+            pikepdf.Dictionary(
+                Type=pikepdf.Name("/Font"),
+                Subtype=pikepdf.Name("/Type0"),
+                BaseFont=pikepdf.Name("/ABCDEF+Deep"),
+                Encoding=pikepdf.Name("/Identity-H"),
+                DescendantFonts=[font],
+            )
+        )
+    return font
+
+
+def name_tree_chain(pdf: pikepdf.Pdf, depth: int, label: str) -> pikepdf.Object:
+    """Return a name tree with one attachment `depth` /Kids levels down.
+
+    A name tree's interior nodes hold /Kids and its leaves hold /Names,
+    and nothing in ISO 32000 section 7.9.6 bounds how many levels of
+    /Kids sit between the root and a leaf.
+    """
+    node = pdf.make_indirect(
+        pikepdf.Dictionary(
+            Names=pikepdf.Array(
+                [
+                    pikepdf.String(label),
+                    pikepdf.Dictionary(
+                        Type=pikepdf.Name("/Filespec"),
+                        F=pikepdf.String(label),
+                    ),
+                ]
+            )
+        )
+    )
+    for _ in range(depth):
+        node = pdf.make_indirect(pikepdf.Dictionary(Kids=pikepdf.Array([node])))
+    return node
+
+
 def build_deep_nesting() -> None:
     """A document nested deeper than any walk here follows.
 
@@ -1011,14 +1154,29 @@ def build_deep_nesting() -> None:
     it gave up, rather than reporting the part it managed to read as the
     whole of the document.
 
-    Two nests, for the two shapes that matters in. The tag tree carries
-    the address at the bottom of a chain of /K entries, so a walk that
-    stopped without saying so would report a tagged document as carrying
-    no structure text at all. The page draws a Form XObject that draws a
-    Form XObject, and so on down to one that draws text through a font
-    of its own -- so the same silence would cost the text that form
-    draws, and then report the characters that font declares as the
-    remnant of a passage that was removed.
+    Four nests, one per shape a walk here can meet.
+
+    The tag tree carries the address at the bottom of a chain of /K
+    entries, so a walk that stopped without saying so would report a
+    tagged document as carrying no structure text at all. That chain is
+    also what the sweep for string objects runs out of depth on, because
+    the address is a string like any other.
+
+    The page draws a Form XObject that draws a Form XObject, and so on
+    down to one that draws text through a font of its own. The same
+    silence would cost the text that form draws; and because the walk
+    that collects fonts stops at the same depth, /FDeep is never reached
+    either, so what the sample proves there is the pair of warnings, not
+    a font finding.
+
+    A font on the page lists a descendant font that lists a descendant
+    font, down to one that declares three characters nothing draws.
+    Reaching the bottom would report them as leftovers; stopping short
+    of it quietly would report the font as declaring nothing at all.
+
+    The attachments hang off a name tree whose /Kids nest just as
+    deeply, with the address for a filename at the bottom of it. Nothing
+    lists that attachment, which is why the walk has to say so.
     """
     name = "deep_nesting.pdf"
     letter_pdf(name, CAPTIONS[name], include_secret=False)
@@ -1062,6 +1220,13 @@ def build_deep_nesting() -> None:
             )
         pdf.pages[0]["/Resources"]["/XObject"] = pikepdf.Dictionary(Fm0=nested)
         pdf.pages[0].contents_add(pdf.make_stream(b"q /Fm0 Do Q\n"))
+
+        pdf.pages[0]["/Resources"]["/Font"]["/FChain"] = descendant_chain(
+            pdf, NESTING_DEPTH
+        )
+        pdf.Root["/Names"] = pikepdf.Dictionary(
+            EmbeddedFiles=name_tree_chain(pdf, NESTING_DEPTH, f"{SECRET}.txt")
+        )
         pdf.save(SAMPLES / name)
 
 
@@ -1091,8 +1256,10 @@ def main() -> None:
     build_lying_image()
     build_smart_quotes()
     build_broken_fonts()
+    build_broken_contents()
     build_form_xobject()
     build_saved_state()
+    build_rebound_font()
     build_deep_nesting()
     print(f"wrote {len(CAPTIONS)} sample PDFs to {SAMPLES}")
 

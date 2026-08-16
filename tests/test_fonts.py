@@ -773,6 +773,91 @@ class TestUnreadableFontDictionaries:
             looped = dict(prc.iter_fonts(pdf))["page 1 /FLoop"]
             assert prc.font_charset(looped) == []
 
+    def test_a_chain_of_descendant_fonts_stops_at_the_depth_limit(
+        self, prc: ModuleType
+    ) -> None:
+        """A descendant font is a font, and can name one of its own.
+
+        Nothing but the depth limit bounds that chain -- the memo of
+        objects already seen only stops it repeating -- so a file that
+        nests it far enough used to end the run in a recursion error,
+        printing a traceback where the report belongs.
+        """
+        stops: list[str] = []
+        with pikepdf.new() as pdf:
+            font = pdf.make_indirect(
+                pikepdf.Dictionary(
+                    Type=pikepdf.Name("/Font"),
+                    Subtype=pikepdf.Name("/Type1"),
+                    BaseFont=pikepdf.Name("/Helvetica"),
+                    Encoding=pikepdf.Name("/WinAnsiEncoding"),
+                    FirstChar=65,
+                    Widths=[500],
+                )
+            )
+            deepest = font
+            for _ in range(200):
+                font = pdf.make_indirect(
+                    pikepdf.Dictionary(
+                        Type=pikepdf.Name("/Font"),
+                        Subtype=pikepdf.Name("/Type0"),
+                        BaseFont=pikepdf.Name("/ABCDEF+Deep"),
+                        Encoding=pikepdf.Name("/Identity-H"),
+                        DescendantFonts=[font],
+                    )
+                )
+            assert prc.font_charset(font, stops=stops) == []
+            assert stops and all(stop.startswith("object ") for stop in stops)
+            # The walk gave up above the bottom, which is why the
+            # character that font declares is not in the charset.
+            assert prc.object_label(deepest) not in stops
+
+    def test_a_chain_within_the_limit_reaches_the_bottom_of_it(
+        self, prc: ModuleType
+    ) -> None:
+        """The negative half: an ordinary composite font is read whole,
+        and says nothing about depth."""
+        stops: list[str] = []
+        with pikepdf.new() as pdf:
+            descendant = pdf.make_indirect(
+                pikepdf.Dictionary(
+                    Type=pikepdf.Name("/Font"),
+                    Subtype=pikepdf.Name("/CIDFontType0"),
+                    BaseFont=pikepdf.Name("/ABCDEF+Deep"),
+                    Encoding=pikepdf.Name("/WinAnsiEncoding"),
+                    FirstChar=65,
+                    Widths=[500],
+                )
+            )
+            font = pikepdf.Dictionary(
+                Type=pikepdf.Name("/Font"),
+                Subtype=pikepdf.Name("/Type0"),
+                BaseFont=pikepdf.Name("/ABCDEF+Deep"),
+                Encoding=pikepdf.Name("/Identity-H"),
+                DescendantFonts=[descendant],
+            )
+            assert prc.font_charset(font, stops=stops) == ["A"]
+        assert stops == []
+
+    def test_a_chain_stopped_with_nobody_collecting_still_stops(
+        self, prc: ModuleType
+    ) -> None:
+        """Every path through the tool collects the places it stopped.
+
+        A caller that collects nothing -- which is what reading this
+        function on its own is -- drops the place it gave up at, and the
+        walk still ends there rather than running on.
+        """
+        font = pikepdf.Dictionary(
+            Type=pikepdf.Name("/Font"),
+            Subtype=pikepdf.Name("/Type1"),
+            BaseFont=pikepdf.Name("/Helvetica"),
+            Encoding=pikepdf.Name("/WinAnsiEncoding"),
+            FirstChar=65,
+            Widths=[500],
+        )
+        assert prc.font_charset(font, depth=prc.MAX_DEPTH + 1) == []
+
     def test_a_descendant_that_is_not_a_font_dictionary_is_reported(
         self, prc: ModuleType
     ) -> None:
@@ -1021,6 +1106,47 @@ class TestDecodedPageText:
             visible = prc.extract_page_text(pdf)
         assert all(char in visible for char in "ÁÉÍ")
         assert not [char for char in "ÙŸŽ" if char in visible]
+
+    def test_a_form_that_rebinds_a_font_name_is_read_through_both_fonts(
+        self, prc: ModuleType, fixtures: Path
+    ) -> None:
+        """The false-positive case, on the committed sample.
+
+        `rebound_font.pdf` draws one form twice under one resource name,
+        which the form's own resources give to a font of its own and the
+        page gives to another. Telling the two drawings apart by the
+        name alone reads the second as a repeat of the first, so the
+        three characters the page's font drew never reach the page text
+        -- and that font, which declares exactly those three, is then
+        reported as carrying the leftovers of a removed passage.
+        """
+        with pikepdf.open(fixtures / "rebound_font.pdf") as pdf:
+            visible = prc.extract_page_text(pdf)
+            fonts = dict(prc.iter_fonts(pdf))
+            page_font = prc.font_charset(fonts["page 1 /FRebound"])
+            form_font = prc.font_charset(fonts["page 1 /Fm0 /FRebound"])
+            orphans = dict(prc.font_orphans(pdf, visible))
+        assert page_font == ["Þ", "Ð", "Š"]
+        assert form_font == ["Ý", "Ž", "Ø"]
+        assert visible.endswith("ÝŽØÞÐŠ")
+        assert orphans == {}
+
+    def test_the_rebound_font_sample_reports_nothing_at_all(
+        self, prc: ModuleType, fixtures: Path
+    ) -> None:
+        """A document whose text is all on the screen is a clean run."""
+        report, _ = prc.analyze(fixtures / "rebound_font.pdf", [])
+        assert [f for f in report.findings if f.severity is not prc.Severity.INFO] == []
+        assert prc.verdict_code(report) == prc.EXIT_CLEAN
+
+    def test_the_rebound_font_sample_draws_what_its_glyph_names_say(
+        self, prc: ModuleType, maketests: ModuleType
+    ) -> None:
+        """The generator names glyphs; the tool resolves them."""
+        page_font = [prc.GLYPH_NAMES[n] for n in maketests.PAGE_FONT_GLYPH_NAMES]
+        form_font = [prc.GLYPH_NAMES[n] for n in maketests.FORM_FONT_GLYPH_NAMES]
+        assert page_font == ["Þ", "Ð", "Š"]
+        assert form_font == ["Ý", "Ž", "Ø"]
 
     def test_the_saved_state_sample_draws_what_its_glyph_names_say(
         self, prc: ModuleType, maketests: ModuleType

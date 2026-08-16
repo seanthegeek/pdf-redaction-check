@@ -171,32 +171,44 @@ even for the samples in this repository, and more from a word processor.
 `INFO` lines are not problems. They record what each layer inspected. Anything
 that could not be read at all is reported as a `WARNING`, naming the page or
 object it concerns where there is one to name, which is what keeps a check that
-found nothing distinguishable from a check that could not run. Seven layers can
-say it:
+found nothing distinguishable from a check that could not run. Seven check
+names can carry one — not the same seven as the layers in the table above.
+Nothing is ever reported this way under `annotations`, and the sweep for text
+outside the text layer reports under two names: `raw-objects` for stream data,
+`raw-strings` for the string objects no other layer claims. The seven are:
 
-- a stream whose declared filters could not be undone and that holds no
-  picture, or that cannot be read at all;
-- a page whose drawing instructions will not parse; a form drawn on it that
-  will not parse, or that is drawn by a name nothing defines; forms drawn
+- `raw-objects`: a stream whose declared filters could not be undone and that
+  holds no picture, or that cannot be read at all;
+- `content-stream`: a page whose drawing instructions will not parse; a page
+  whose `/Contents` is neither a content stream nor an array of them, or an
+  entry of that array that is not a content stream, either of which a parser
+  hands back no instructions for rather than refusing; a form drawn on the page
+  that will not parse, or that is drawn by a name nothing defines; forms drawn
   inside one another more than 64 levels deep, which is where every walk here
-  stops — see "Limitations"; text drawn before any font was selected, or with a
-  font the resources in effect do not define, or with a character code that
-  font does not map; or a `Q` operator restoring a graphics state that no `q`
-  had saved, after which the font the text is read through is a guess;
-- a font whose character map, `/Widths` array, or `/FirstChar` cannot be read,
-  a descendant font entry that is not a font dictionary, a `/Font` resource
-  that is not a font dictionary at all, a `/ToUnicode` entry that is not the
-  stream a character map lives in, or forms nested past that same limit, so
-  that the fonts inside them were never reached;
-- a tagged-PDF structure tree nested past that limit, so the tags below it were
-  not inspected;
-- an object graph nested past that limit, so the string objects below it were
-  not swept — reported when a dump mode or a `--secret` asked for that sweep,
-  which is when it runs;
-- an `/Info` entry that is not a dictionary, or an XMP metadata packet that
-  cannot be read, so that metadata was not inspected;
-- a `/Names` entry that is not a dictionary, so embedded attachments could not
-  be looked for.
+  stops — see "Limitations"; text drawn before any font was selected, with a
+  font the resources in effect do not define, with a name they define as
+  something other than a font dictionary, or with a character code that font
+  does not map; or a `Q` operator with no `q` left to restore a graphics state
+  from, after which the text is read on the assumption that a reader would
+  leave the font where it stands;
+- `font-charset`: a font whose character map, `/Widths` array, or `/FirstChar`
+  cannot be read, a descendant font entry that is not a font dictionary, a
+  `/Font` resource that is not a font dictionary at all, a `/ToUnicode` entry
+  that is not the stream a character map lives in, forms nested past that same
+  limit, so that the fonts inside them were never reached, or a font's chain of
+  descendant fonts nested past it, so that what the font at the bottom declares
+  was never read;
+- `structure-tree`: a tagged-PDF structure tree nested past that limit, so the
+  tags below it were not inspected;
+- `raw-strings`: an object graph nested past that limit, so the string objects
+  below it were not swept — reported when a dump mode or a `--secret` asked for
+  that sweep, which is when it runs;
+- `metadata`: an `/Info` entry that is not a dictionary, or an XMP metadata
+  packet that cannot be read, so that metadata was not inspected;
+- `attachments`: a `/Names` entry that is not a dictionary, so embedded
+  attachments could not be looked for, or a tree of embedded file names nested
+  past that limit, so the attachments below it were not listed — that one, like
+  the string sweep, is reported when a dump mode or a `--secret` runs it.
 
 A document with nothing to report ends on:
 
@@ -393,18 +405,26 @@ file is clean.
   way, from the pages outwards, so a font named only by an annotation's
   appearance stream or by the form field defaults in `/AcroForm` is not one
   whose leftovers this inspects. A form drawn more than once is read once per
-  distinct drawing, told apart by the form, the font in effect, the stream that
-  drew it, and the innermost resources in effect there. Two drawings that agree
-  on all four but differ further out in the chain of resources — which takes a
-  document built to do it — are read once, and the second one's text is missing
-  from the page text.
-- **Structures nested more than 64 levels deep.** Every walk here — the tag
-  tree, the object graph, forms drawn inside forms, the resources reached
-  through them — stops at that depth, because a hostile file can nest a
+  distinct drawing, told apart by the form, the font in effect — both the
+  resource name it was selected by and the font that name resolved to — and the
+  content stream that drew it. Two drawings can still differ further out in the
+  chain of resources than those three reach, which takes a document built to do
+  it: a form drawn from two places draws a second form of its own, and the
+  inner drawing looks the same both times — one form, one font in effect, one
+  stream drawing it — while the outer resources that decide what it draws
+  differ. That one is read once, and the second reading's text is missing from
+  the page text.
+- **Structures nested more than 64 levels deep.** Six walks here stop at that
+  depth — the tag tree, the object graph, forms drawn inside forms, the
+  resources reached through them, a font's chain of descendant fonts, and the
+  tree the embedded file names hang off — because a hostile file can nest a
   structure forever and a walk that followed it would never finish. What is
-  below the limit is not inspected, and each walk reports where it gave up, so
-  this shows up as a warning rather than as a clean result. Ordinary documents
-  are nowhere near it.
+  below the limit is not inspected, and every walk that stops says where it
+  gave up, so this shows up as a warning rather than as a clean result. Two of
+  the six only run when a dump mode or a `--secret` asks for them — the object
+  graph and the tree of file names — so a default run says nothing about those
+  two, as the list of warnings above notes. Ordinary documents are nowhere near
+  the limit.
 - **Heuristic, not proof.** The font-charset check infers intent from
   structure. Documents with legitimate unused glyphs may produce findings that
   are not leaks.

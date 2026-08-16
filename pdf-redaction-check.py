@@ -66,10 +66,11 @@ EXIT_USAGE = 4
 
 # How many levels down any walk of the document goes before it stops.
 # Every structure this follows -- the tag tree, the object graph, forms
-# drawn inside forms, resources reached through them -- can be nested as
-# deeply as a file cares to nest it, and a hostile one nests it forever.
-# Stopping is the defense; stopping quietly is not allowed, so every
-# walk that reaches this limit says where it gave up.
+# drawn inside forms, the resources reached through them, a font's chain
+# of descendant fonts, and the name tree the attachments hang off -- can
+# be nested as deeply as a file cares to nest it, and a hostile one
+# nests it forever. Stopping is the defense; stopping quietly is not
+# allowed, so every walk that reaches this limit says where it gave up.
 MAX_DEPTH = 64
 
 # Glyph names that carry no evidential weight when orphaned: whitespace
@@ -281,11 +282,17 @@ class Severity(Enum):
 # The two dump modes. Anything else is not a mode this tool has.
 DumpMode = Literal["hidden", "all"]
 
+# What names the font a drawing was made with: the object number and
+# generation of the font dictionary, or -- for a font dictionary written
+# out in place, which has no number of its own -- what that font turns
+# every character code into. See `font_identity`. The two are different
+# shapes, so a font of one kind is never mistaken for one of the other.
+FontIdentity = tuple[int, int] | frozenset[tuple[int, str]]
+
 # One drawing of a Form XObject: the form, the resource name of the font
-# in effect, the content stream that drew it, and the innermost
-# resources in effect there, each object named by its number and
-# generation. See `already_drawn`.
-FormDrawing = tuple[tuple[int, int], str, tuple[int, int], tuple[int, int]]
+# in effect, which font that name resolved to, and the content stream
+# that drew it. See `already_drawn`.
+FormDrawing = tuple[tuple[int, int], str, FontIdentity, tuple[int, int]]
 
 
 class FindingJSON(TypedDict):
@@ -414,9 +421,17 @@ def depth_limit_note(what: str, stops: list[str]) -> str:
     `what` names the structure that was being walked. `stops` holds the
     place each branch of it gave up at, in the order they were reached,
     so the count says how much went unread and the first says where to
-    start looking. It is never empty: a caller with nothing to report
-    does not call this.
+    start looking.
+
+    Raises ValueError when `stops` is empty. A walk that gave up nowhere
+    has nothing to describe, and the message this would build for it --
+    "0 branch(es) of it below that depth were not inspected" -- reports
+    a walk that finished as a walk that stopped short.
     """
+    if not stops:
+        raise ValueError(
+            "depth_limit_note needs the place at least one branch stopped at"
+        )
     return (
         f"{what} is nested more than {MAX_DEPTH} levels deep, so "
         f"{len(stops)} branch(es) of it below that depth were not inspected"
@@ -1076,6 +1091,8 @@ def font_charset(
     font: pikepdf.Object,
     problems: list[str] | None = None,
     seen: set[tuple[int, int]] | None = None,
+    stops: list[str] | None = None,
+    depth: int = 0,
 ) -> list[str]:
     """Collect every character a font object claims it can render.
 
@@ -1086,9 +1103,23 @@ def font_charset(
 
     A font is a dictionary, and a /Font resource group can name anything
     at all: pikepdf hands a number back as a plain Python object, which
-    has none of the methods the rest of this reads a font with. Nothing
-    is a font declaring no characters -- it is a font nobody could read.
+    has none of the methods the rest of this reads a font with. Such a
+    resource is not a font that declares no characters -- it is a font
+    nobody could read, and is reported as one.
+
+    A composite font's characters are declared by the descendant font it
+    lists, which is a font in its own right and can list a descendant of
+    its own, so the walk down that chain is bounded like every other
+    here. `stops` is where the places it gave up at are recorded, one
+    per branch that went deeper than the limit. Every path through the
+    tool passes a list; None is for a caller collecting nothing, which
+    is what a test reading this on its own wants, and never means there
+    was nothing to record.
     """
+    if depth > MAX_DEPTH:
+        if stops is not None:
+            stops.append(object_label(font))
+        return []
     if not isinstance(font, pikepdf.Dictionary):
         note(
             problems,
@@ -1135,7 +1166,7 @@ def font_charset(
                     "the characters it declares were not inspected",
                 )
                 continue
-            chars += font_charset(descendant, problems, seen)
+            chars += font_charset(descendant, problems, seen, stops, depth + 1)
 
     return dedupe(chars)
 
@@ -1212,11 +1243,16 @@ class FontDecoder:
     resource gets its own table: its /ToUnicode CMap where it has one,
     otherwise its /Encoding, with any /Differences applied over the base
     encoding.
+
+    `identity` names the font this was built from, and is what tells two
+    fonts apart that a document selects by the same resource name; see
+    `font_identity` and `already_drawn`.
     """
 
     label: str
     code_bytes: int
     table: dict[int, str]
+    identity: FontIdentity = (0, 0)
 
     def decode(self, raw: bytes) -> tuple[str, int]:
         """Return the text `raw` draws, and how many codes had no mapping.
@@ -1281,6 +1317,28 @@ def simple_font_table(font: pikepdf.Object) -> dict[int, str]:
     return table
 
 
+def font_identity(font: pikepdf.Object, table: dict[int, str]) -> FontIdentity:
+    """Name the font a drawing was made with, for `already_drawn`.
+
+    A font dictionary that is an indirect object is named by its number
+    and generation, which is exact and costs nothing to compare.
+
+    A font dictionary written out in place has no number to give, and
+    naming every such font the same thing would make two of them under
+    one resource name look like one font -- which drops the second
+    drawing's text, and leaves the font that really drew it looking like
+    it declares characters the page never showed. What stands in for the
+    number is what the font turns character codes into: two fonts that
+    turn every code into the same characters draw the same text, so
+    treating those two as one costs nothing, and two that do not are
+    told apart.
+    """
+    objgen = getattr(font, "objgen", (0, 0))
+    if objgen != (0, 0):
+        return objgen
+    return frozenset(table.items())
+
+
 def font_decoder(label: str, font: pikepdf.Object) -> FontDecoder:
     """Build the code-to-text table for one font resource.
 
@@ -1295,34 +1353,80 @@ def font_decoder(label: str, font: pikepdf.Object) -> FontDecoder:
         table.update(simple_font_table(font))
     if cmap is not None:
         table.update(cmap.entries)
-    return FontDecoder(label, code_bytes, table)
+    return FontDecoder(label, code_bytes, table, font_identity(font, table))
+
+
+@dataclass(frozen=True)
+class FontState:
+    """The font a content stream is drawing with.
+
+    `label` is the resource name the last Tf operator asked for, and is
+    empty when no font has been selected yet. `decoder` is what that
+    name resolved to, and is None when nothing usable came back.
+
+    `defined` says whether the resources in effect name that resource at
+    all. It is what tells a name nothing defines apart from a name
+    defined as something other than a font dictionary: both leave text
+    nobody could read, but they are two different faults in the
+    document, and only one of them is a resource that is missing.
+    """
+
+    label: str = ""
+    decoder: FontDecoder | None = None
+    defined: bool = False
+
+    @property
+    def identity(self) -> FontIdentity:
+        """Name the font in effect, for the record of a drawing.
+
+        (0, 0) is the answer for a name that resolved to nothing: no
+        font dictionary was reached, so there is none to name. No font
+        this could read ever answers with it -- an indirect object's
+        number is never zero, and a font written out in place is named
+        by what it decodes to instead. See `font_identity`.
+        """
+        return self.decoder.identity if self.decoder is not None else (0, 0)
+
+
+# The font in effect before any Tf operator has selected one. A content
+# stream starts here, and so does a form that is drawn before the stream
+# drawing it has selected a font.
+NO_FONT = FontState()
 
 
 def select_font(
     fonts: dict[str, pikepdf.Object],
     decoders: dict[str, FontDecoder],
     operands: Iterable[pikepdf.Object],
-) -> tuple[str, FontDecoder | None]:
+) -> FontState:
     """Resolve the font a Tf operator selects, caching the result.
 
     `fonts` is the /Font group of the resources in effect, merged across
     the scopes that were in effect where the text was drawn. Returns the
-    resource name the operator asked for -- empty if it named none --
-    and the decoder for it, or None when none of those resources define
-    that font.
+    font now in effect: the resource name the operator asked for --
+    empty if it named none -- what that name resolved to, and whether
+    those resources define the name at all.
+
+    A name they define as something other than a font dictionary
+    resolves to nothing, the same as a name they do not define, and the
+    two are kept apart: pikepdf hands a number back as a plain Python
+    object, and reporting a resource that is there as one that is
+    missing sends whoever reads the report to the wrong place.
     """
     for operand in operands:
         if not isinstance(operand, pikepdf.Name):
             continue
         label = str(operand)
         if label in decoders:
-            return label, decoders[label]
+            return FontState(label, decoders[label], True)
         font = fonts.get(label)
+        if font is None:
+            return FontState(label, None, False)
         if not isinstance(font, pikepdf.Dictionary):
-            return label, None
+            return FontState(label, None, True)
         decoders[label] = font_decoder(label, font)
-        return label, decoders[label]
-    return "", None
+        return FontState(label, decoders[label], True)
+    return NO_FONT
 
 
 def show_text_bytes(operands: Iterable[pikepdf.Object]) -> Iterator[bytes]:
@@ -1362,65 +1466,92 @@ def undecoded_note(label: str, count: int) -> str:
     )
 
 
+def unusable_font_note(label: str, count: int) -> str:
+    """Describe text drawn with a resource that is not a font dictionary.
+
+    The name was defined where the text was drawn -- this is not a
+    missing resource -- but what it was defined as is not something a
+    character code can be looked up in. pikepdf hands a number back as a
+    plain Python object, which has none of the methods a font is read
+    with, so the font-subset check reports the same resource separately
+    as a font it could not inspect.
+    """
+    return (
+        f"{count} byte(s) of page text were drawn with {label}, which the "
+        "resources in effect where it was drawn define as something other "
+        "than a font dictionary, so what they spell could not be worked out"
+    )
+
+
 @dataclass
 class PageText:
     """What reading one page's drawing instructions has turned up.
 
     `out` is the text so far, in drawing order. `unresolved` counts the
     bytes drawn with a font resource nothing defined, by the name the
-    document asked for; `unmapped` counts the character codes a font had
-    no mapping for, by font label. Both are counted rather than
+    document asked for; `unusable` counts the bytes drawn with a name
+    that was defined as something other than a font dictionary, by that
+    name; and `unmapped` counts the character codes a font had no
+    mapping for, by font label. All three are counted rather than
     described one by one, because a font that fails once usually fails
     for every code it draws. `problems` holds anything else that could
-    not be read.
+    not be read, and `stops` the place each chain of forms that went
+    deeper than the walk follows gave up at.
 
     `drawn` records each form already followed, together with the font
-    in effect, the stream that drew it, and the innermost resources
-    there, so that a form drawn twice under two different fonts -- which
-    draws different characters each time, because a form inherits the
-    font in effect where it is drawn -- is read both times, while a form
-    that draws itself cannot loop. Recording those four rather than the
-    whole path taken to the form is also what keeps a file whose forms
-    draw one another from costing far more work than it has objects.
-    See `already_drawn`.
+    in effect and the stream that drew it, so that a form drawn twice
+    under two different fonts -- which draws different characters each
+    time, because a form inherits the font in effect where it is drawn
+    -- is read both times, while a form that draws itself cannot loop.
+    Recording those three rather than the whole path taken to the form
+    is also what keeps a file whose forms draw one another from costing
+    far more work than it has objects. See `already_drawn`.
     """
 
     out: list[str] = field(default_factory=list)
     unresolved: dict[str, int] = field(default_factory=dict)
+    unusable: dict[str, int] = field(default_factory=dict)
     unmapped: dict[str, int] = field(default_factory=dict)
     problems: list[str] = field(default_factory=list)
+    stops: list[str] = field(default_factory=list)
     drawn: set[FormDrawing] = field(default_factory=set)
 
 
 def already_drawn(
     form: pikepdf.Object,
-    label: str,
+    font: FontState,
     container: pikepdf.Object | pikepdf.Page,
-    scope: pikepdf.Object | None,
     drawn: set[FormDrawing],
 ) -> bool:
     """Record one drawing of a form, reporting whether it is a repeat.
 
-    A drawing is the form, the resource name of the font in effect, the
-    content stream that drew it, and the innermost resources in effect
-    there. Recording the form alone would drop the text of every drawing
-    after the first, and a character the page showed but nothing
-    recorded is a character the font-subset check reports as the remnant
-    of a removed passage.
+    A drawing is the form, the font in effect where it was drawn -- both
+    the resource name and which font that name resolved to, as
+    `font_identity` names it -- and the content stream that drew it.
+    Recording the form alone would drop the text of every drawing after
+    the first, and a character the page showed but nothing recorded is a
+    character the font-subset check reports as the remnant of a removed
+    passage.
+
+    The font is recorded as the pair rather than as the name alone
+    because one name means different fonts in different places: a form
+    whose own /Resources rebind a name the page also uses draws that
+    form's font inside itself and the page's font outside, both under
+    the one name. Recording the name alone loses the second drawing, and
+    with it the characters the page's own font really did show.
 
     What a drawing produces really depends on the whole chain of
     resources in effect, which is a path rather than a place: keeping
     paths would cost a file whose forms draw one another far more work
     than it has objects, and would stop a form that draws itself from
     ever repeating a drawing, so the walk would only end at the depth
-    limit. These four stand in for the chain instead. Neither the stream
-    that drew the form nor the innermost resources there is enough
-    alone: two forms can share one /Resources dictionary and be drawn
-    from different places, and one form with no resources of its own can
-    be drawn from two places and take different ones each time. Together
-    they tell both apart. Two drawings that agree on all four can still
-    differ further out in the chain, which costs the second one's text;
-    the README says so under "Limitations".
+    limit. These three stand in for the chain instead, and what they
+    miss is a drawing that differs further out than they reach: a form
+    drawn from two places draws a second form of its own, and the two
+    records of that inner drawing agree -- one form, one font in effect,
+    one stream drawing it -- while the resources further out, which
+    decide what it draws, do not. The second reading is dropped and its
+    text with it; the README says so under "Limitations".
 
     A form that is not an indirect object is always drawn: it has no
     object number to record, and having no identity of its own it cannot
@@ -1431,9 +1562,9 @@ def already_drawn(
         return False
     key: FormDrawing = (
         objgen,
-        label,
+        font.label,
+        font.identity,
         getattr(container, "objgen", (0, 0)),
-        getattr(scope, "objgen", (0, 0)),
     )
     if key in drawn:
         return True
@@ -1445,21 +1576,20 @@ def draw_content(
     content: pikepdf.Object | pikepdf.Page,
     scopes: tuple[pikepdf.Object | None, ...],
     found: PageText,
-    current: FontDecoder | None = None,
-    label: str = "",
+    font: FontState = NO_FONT,
     depth: int = 0,
 ) -> None:
     """Read the text one content stream draws, following Form XObjects.
 
     `scopes` is the /Resources dictionaries in effect, innermost first,
     and is never empty: the page's own resources are the last of them,
-    and are None when the page has none. `current` and `label` are the
-    font in effect where this stream starts.
+    and are None when the page has none. `font` is the font in effect
+    where this stream starts.
 
     A form inherits the graphics state of whatever drew it, so
     text inside one can be drawn with a font selected before the `Do`
     that invoked it; a font selected inside the form does not leak back
-    out, which is why both are arguments here rather than kept in
+    out, which is why the font is an argument here rather than kept in
     `found`.
 
     The font is part of the graphics state that `q` saves and `Q`
@@ -1470,40 +1600,37 @@ def draw_content(
     and goes away with it -- neither half of a pair can cross the
     boundary of a form.
 
-    A `Q` with nothing left to restore is malformed. Readers ignore it
-    and so does this, which leaves the font in effect unchanged, and it
-    is reported rather than passed over: from there on, the font this
-    reads the page through is a guess.
+    A `Q` with nothing left to restore is malformed. Readers leave the
+    graphics state alone when they meet one, and so does this, which
+    leaves the font in effect unchanged. It is reported rather than
+    passed over, because from there on the text is read on the
+    assumption that a reader would do the same.
     """
     # `found.drawn` stops a form that draws itself, but only a form that
     # is an object in its own right, which is the only kind a document
     # read from a file can have. The depth limit is what stops the rest.
     if depth > MAX_DEPTH:
-        found.problems.append(
-            f"forms drawn inside one another are nested more than {MAX_DEPTH} "
-            f"levels deep, so the text drawn by {object_label(content)}, and "
-            "by anything it draws in turn, was not inspected"
-        )
+        found.stops.append(object_label(content))
         return
     fonts = resource_scope(scopes, "/Font")
     xobjects = resource_scope(scopes, "/XObject")
     decoders: dict[str, FontDecoder] = {}
-    saved: list[tuple[str, FontDecoder | None]] = []
+    saved: list[FontState] = []
     unrestored = 0
 
     for instruction in pikepdf.parse_content_stream(content):
         operator = str(instruction.operator)
         if operator == "q":
-            saved.append((label, current))
+            saved.append(font)
             continue
         if operator == "Q":
             if saved:
-                label, current = saved.pop()
+                font = saved.pop()
             else:
                 unrestored += 1
             continue
         if operator == "Tf":
-            label, current = select_font(fonts, decoders, instruction.operands)
+            font = select_font(fonts, decoders, instruction.operands)
             continue
         if operator == "Do":
             draw_form(
@@ -1511,8 +1638,7 @@ def draw_content(
                 scopes,
                 instruction.operands,
                 found,
-                current,
-                label,
+                font,
                 depth,
                 content,
             )
@@ -1520,22 +1646,23 @@ def draw_content(
         if operator not in SHOW_TEXT_OPERATORS:
             continue
         for raw in show_text_bytes(instruction.operands):
-            if current is None:
-                found.unresolved[label] = found.unresolved.get(label, 0) + len(raw)
+            if font.decoder is None:
+                counted = found.unusable if font.defined else found.unresolved
+                counted[font.label] = counted.get(font.label, 0) + len(raw)
                 continue
-            text, dropped = current.decode(raw)
+            text, dropped = font.decoder.decode(raw)
             found.out.append(text)
             if dropped:
-                found.unmapped[current.label] = (
-                    found.unmapped.get(current.label, 0) + dropped
+                found.unmapped[font.decoder.label] = (
+                    found.unmapped.get(font.decoder.label, 0) + dropped
                 )
 
     if unrestored:
         found.problems.append(
-            f"{unrestored} Q operator(s) restored a graphics state that no q "
-            "had saved, which leaves the font in effect where a reader would "
-            "leave it, so what the text after them spells could only be "
-            "worked out on that assumption"
+            f"{unrestored} Q operator(s) had no q left to restore a graphics "
+            "state from, which leaves the font in effect where a reader would "
+            "leave it, so what the text after them spells could only be worked "
+            "out on that assumption"
         )
 
 
@@ -1544,8 +1671,7 @@ def draw_form(
     scopes: tuple[pikepdf.Object | None, ...],
     operands: Iterable[pikepdf.Object],
     found: PageText,
-    current: FontDecoder | None,
-    label: str,
+    font: FontState,
     depth: int,
     container: pikepdf.Object | pikepdf.Page,
 ) -> None:
@@ -1579,15 +1705,14 @@ def draw_form(
             return
         if not is_form_xobject(target):
             return
-        if already_drawn(target, label, container, scopes[0], found.drawn):
+        if already_drawn(target, font, container, found.drawn):
             return
         try:
             draw_content(
                 target,
                 (target.get("/Resources"), *scopes),
                 found,
-                current,
-                label,
+                font,
                 depth + 1,
             )
         except UNPARSABLE_CONTENT as exc:
@@ -1598,7 +1723,42 @@ def draw_form(
         return
 
 
-def _page_text(page: pikepdf.Page) -> tuple[str, list[str]]:
+def content_problems(page: pikepdf.Page) -> list[str]:
+    """Describe a /Contents entry that is not drawing instructions.
+
+    A page's /Contents is a content stream, or an array of them that a
+    reader treats as one (ISO 32000 Table 30). A page carrying none
+    draws nothing, which is ordinary and is not reported.
+
+    Anything else draws nothing here either. Handed a page of a
+    document read from a file whose /Contents is a number or a
+    dictionary, pikepdf's content parser answers with no instructions at
+    all rather than refusing, and it passes over an array entry that is
+    not a stream the same way. Either one reads exactly like a page that
+    draws nothing, so what the parser passes over in silence is said
+    here. (The same page of a document still being built in memory
+    raises instead, which `extract_page_text` reports as a content
+    stream it could not parse.)
+    """
+    contents = page.get("/Contents")
+    if contents is None or isinstance(contents, pikepdf.Stream):
+        return []
+    if not isinstance(contents, pikepdf.Array):
+        neither = (
+            "the page's drawing instructions (/Contents) are neither a content "
+            "stream nor an array of them, so the text the page draws was not "
+            "inspected"
+        )
+        return [neither]
+    return [
+        f"entry {position} of the page's drawing instructions (/Contents) array "
+        "is not a content stream, so the text it draws was not inspected"
+        for position, item in enumerate(contents)
+        if not isinstance(item, pikepdf.Stream)
+    ]
+
+
+def _page_text(page: pikepdf.Page) -> tuple[str, list[str], list[str]]:
     """Decode the text one page draws, through the fonts it draws it with.
 
     Text drawn inside a Form XObject counts as text the page draws,
@@ -1606,21 +1766,33 @@ def _page_text(page: pikepdf.Page) -> tuple[str, list[str]]:
     every `Do` that names one. A form the page never draws is a
     different thing, and is not page text.
 
-    Returns the text and a description of every run that could not be
-    decoded, so a page that yielded no text stays distinguishable from a
-    page whose text could not be read.
+    Returns the text, a description of every run that could not be
+    decoded -- so a page that yielded no text stays distinguishable from
+    a page whose text could not be read -- and the place each chain of
+    forms that went deeper than the walk follows gave up at, which the
+    caller reports as one finding rather than one per branch.
+
+    A /Contents entry that is not drawing instructions is not described
+    here. That reading has to survive this raising, so the caller makes
+    it; see `content_problems`.
     """
     found = PageText()
+    problems: list[str] = []
     draw_content(page, (page_resources(page),), found)
 
-    problems = [undecoded_note(name, count) for name, count in found.unresolved.items()]
+    problems += [
+        undecoded_note(name, count) for name, count in found.unresolved.items()
+    ]
+    problems += [
+        unusable_font_note(name, count) for name, count in found.unusable.items()
+    ]
     problems += [
         f"{count} character code(s) drawn with {name} are mapped by neither "
         "its /ToUnicode CMap nor its /Encoding, so what they spell could not "
         "be worked out"
         for name, count in found.unmapped.items()
     ]
-    return "".join(found.out), problems + found.problems
+    return "".join(found.out), problems + found.problems, found.stops
 
 
 def extract_page_text(pdf: pikepdf.Pdf, report: Report | None = None) -> str:
@@ -1632,25 +1804,42 @@ def extract_page_text(pdf: pikepdf.Pdf, report: Report | None = None) -> str:
     given, every page and every run that could not be read is recorded
     there, so a document that yielded no text stays distinguishable from
     one whose text could not be read.
+
+    Those findings are located by page. The one for forms drawn inside
+    one another past the depth limit names the form the walk gave up at
+    instead, as the other walks do: it counts branches rather than
+    listing them, so an object to point at is the only thing that says
+    where to start looking.
     """
     chunks: list[str] = []
     for index, page in enumerate(pdf.pages, start=1):
+        # Read what /Contents is before trying to read what it draws:
+        # an entry of it that nobody could read is still worth saying
+        # when reading the rest of it fails as well.
+        problems = content_problems(page)
+        stops: list[str] = []
         try:
-            text, problems = _page_text(page)
+            text, decoded, stops = _page_text(page)
         except UNPARSABLE_CONTENT as exc:
-            if report is not None:
-                report.add(
-                    Severity.WARNING,
-                    CONTENT_STREAM,
-                    "the page content stream could not be parsed, so the "
-                    f"text it draws was not inspected: {exc}",
-                    f"page {index}",
-                )
-            continue
-        chunks.append(text)
+            problems.append(
+                "the page content stream could not be parsed, so the "
+                f"text it draws was not inspected: {exc}"
+            )
+        else:
+            chunks.append(text)
+            problems += decoded
         if report is not None:
             for problem in problems:
                 report.add(Severity.WARNING, CONTENT_STREAM, problem, f"page {index}")
+            if stops:
+                report.add(
+                    Severity.WARNING,
+                    CONTENT_STREAM,
+                    depth_limit_note(
+                        "the chain of forms drawn inside one another", stops
+                    ),
+                    stops[0],
+                )
     return "\n".join(chunks)
 
 
@@ -1781,7 +1970,9 @@ def extract_metadata(pdf: pikepdf.Pdf, report: Report | None = None) -> list[Ext
     return out
 
 
-def extract_attachments(pdf: pikepdf.Pdf) -> list[Extract]:
+def extract_attachments(
+    pdf: pikepdf.Pdf, report: Report | None = None
+) -> list[Extract]:
     """List embedded file names and sizes.
 
     Attachment contents are deliberately not extracted: they are
@@ -1791,22 +1982,50 @@ def extract_attachments(pdf: pikepdf.Pdf) -> list[Extract]:
     A /Names entry that is not a dictionary yields nothing here and is
     reported by `check_attachments`, which is where findings about the
     document go.
+
+    `report` is where a name tree nested deeper than the walk follows is
+    recorded. None means this caller is not the one reporting it, not
+    that there is nothing to report: an attachment below the limit is an
+    attachment nobody listed, and a file that was never looked for must
+    not read as a file that is not there.
     """
     names = pdf.Root.get("/Names")
     if not isinstance(names, pikepdf.Dictionary) or "/EmbeddedFiles" not in names:
         return []
     out: list[Extract] = []
-    for label, size in _iter_embedded_files(names["/EmbeddedFiles"]):
+    stops: list[str] = []
+    for label, size in _iter_embedded_files(names["/EmbeddedFiles"], stops=stops):
         detail = f"{label} ({size} bytes)" if size is not None else label
         out.append(Extract(ATTACHMENTS, "embedded file", detail))
+    if stops and report is not None:
+        report.add(
+            Severity.WARNING,
+            ATTACHMENTS,
+            depth_limit_note("the tree of embedded file names", stops),
+            stops[0],
+        )
     return out
 
 
 def _iter_embedded_files(
     tree: pikepdf.Object,
     seen: set[tuple[int, int]] | None = None,
+    stops: list[str] | None = None,
+    depth: int = 0,
 ) -> Iterator[tuple[str, int | None]]:
-    """Walk a name tree, yielding (filename, size) for each attachment."""
+    """Walk a name tree, yielding (filename, size) for each attachment.
+
+    The tree's /Kids arrays nest, so the walk is bounded like every
+    other here. `stops` is where the places it gave up at are recorded,
+    one per branch that went deeper than the limit. Every path through
+    the tool passes a list; None is for a caller collecting nothing,
+    which is what a test reading this on its own wants, and never means
+    there was nothing to record.
+    """
+    if depth > MAX_DEPTH:
+        if stops is not None:
+            stops.append(object_label(tree))
+        return
     if seen is None:
         seen = set()
     if not isinstance(tree, pikepdf.Dictionary) or already_seen(tree, seen):
@@ -1814,7 +2033,7 @@ def _iter_embedded_files(
     kids = tree.get("/Kids")
     if isinstance(kids, pikepdf.Array):
         for kid in kids:
-            yield from _iter_embedded_files(kid, seen)
+            yield from _iter_embedded_files(kid, seen, stops, depth + 1)
     entries = tree.get("/Names")
     if not isinstance(entries, pikepdf.Array):
         return
@@ -1935,15 +2154,18 @@ def font_orphans(
 
     When `report` is given, anything a font declared that could not be
     read is recorded there first, so a font this could not inspect never
-    passes for a font with nothing to declare. Forms nested deeper than
-    the walk that finds the fonts follows are recorded there too, once
-    the walk is done, for the same reason.
+    passes for a font with nothing to declare. The two walks that can
+    run out of depth before they run out of document -- the forms the
+    fonts are reached through, and a font's chain of descendant fonts --
+    are recorded there too, once the walks are done, for the same
+    reason.
     """
     visible = set(visible_text)
-    stops: list[str] = []
-    for label, font in iter_fonts(pdf, stops):
+    form_stops: list[str] = []
+    charset_stops: list[str] = []
+    for label, font in iter_fonts(pdf, form_stops):
         problems: list[str] = []
-        charset = font_charset(font, problems)
+        charset = font_charset(font, problems, stops=charset_stops)
         if report is not None:
             for problem in problems:
                 report.add(Severity.WARNING, FONT_CHARSET, problem, label)
@@ -1956,12 +2178,27 @@ def font_orphans(
         ]
         if orphans:
             yield label, orphans
-    if stops and report is not None:
+    if report is None:
+        return
+    if charset_stops:
         report.add(
             Severity.WARNING,
             FONT_CHARSET,
-            depth_limit_note("the chain of forms drawn inside one another", stops),
-            stops[0],
+            depth_limit_note("a font's chain of descendant fonts", charset_stops),
+            charset_stops[0],
+        )
+    if form_stops:
+        report.add(
+            Severity.WARNING,
+            FONT_CHARSET,
+            # Named for the walk rather than for the structure: the page
+            # text is read through a second walk of the same forms, and
+            # two findings that read alike would look like one said
+            # twice rather than two walks that each stopped.
+            depth_limit_note(
+                "the chain of forms the fonts are reached through", form_stops
+            ),
+            form_stops[0],
         )
 
 
@@ -1980,16 +2217,17 @@ def collect_extracts(
 ) -> list[Extract]:
     """Gather every recoverable piece of text, layer by layer.
 
-    `report` is passed on to the catch-all string sweep, which is the
-    one layer here that can run out of depth before it runs out of
-    document. None means this caller is not collecting findings, which
-    is what a test reading one layer in isolation wants.
+    `report` is passed on to the two layers here that can run out of
+    depth before they run out of document: the catch-all string sweep,
+    and the tree the embedded file names hang off. None means this
+    caller is not collecting findings, which is what a test reading one
+    layer in isolation wants.
     """
     specific: list[Extract] = []
     specific += extract_structure_tree(pdf)
     specific += extract_annotations(pdf)
     specific += extract_metadata(pdf)
-    specific += extract_attachments(pdf)
+    specific += extract_attachments(pdf, report)
 
     known = {e.text for e in specific}
     known.add(visible_text)
@@ -2382,31 +2620,46 @@ def check_fonts(pdf: pikepdf.Pdf, report: Report, visible_text: str) -> None:
         )
 
 
+def reject_blank_secrets(secrets: list[str]) -> None:
+    """Refuse a secret with nothing in it, whoever supplied it.
+
+    Text with nothing in it is in every document ever written: matching
+    it convicts every document, and dropping it silently checks none of
+    them while looking like it did. Neither is an answer, so it is
+    refused rather than guessed at.
+
+    The message names --secret as the usual way one arrives without
+    telling a caller of `analyze` that it used a command-line option it
+    never saw.
+
+    Raises UsageError, which is a condition of the invocation rather
+    than of the document, so the caller ends the run with the
+    usage-error exit code and no verdict.
+    """
+    if any(not secret.strip() for secret in secrets):
+        raise UsageError(
+            "a secret with nothing in it was given, and every document "
+            "contains that; name the text that must not survive, or drop "
+            "the --secret whose value went missing"
+        )
+
+
 def load_secrets(args: argparse.Namespace) -> list[str]:
     """Collect secrets from --secret and --secret-file.
 
     The two sources treat a blank differently on purpose. A file holds
     one secret per line, so a line with nothing on it is formatting and
     is dropped. A --secret is a statement that this text must not
-    survive anywhere, and text with nothing in it is in every document
-    ever written: matching it convicts every document, and dropping it
-    silently checks none of them while looking like it did. The shape
-    this arrives in is a CI gate running --secret "$NAME" with the
-    variable unset, so it is refused rather than guessed at.
+    survive anywhere, so a blank one is refused: the shape it arrives in
+    is a CI gate running --secret "$NAME" with the variable unset.
 
     Raises UsageError for a blank --secret, OSError if the file named by
     --secret-file cannot be opened, and UnicodeDecodeError if that file
     is not UTF-8 text. All three are conditions of the invocation rather
     than of the document, and the caller reports them as usage errors.
     """
-    secrets: list[str] = []
-    for secret in args.secret or []:
-        if not secret.strip():
-            raise UsageError(
-                "--secret was given text with nothing in it, which every "
-                "document contains; name the text that must not survive"
-            )
-        secrets.append(secret)
+    secrets: list[str] = list(args.secret or [])
+    reject_blank_secrets(secrets)
     if args.secret_file:
         content = Path(args.secret_file).read_text(encoding="utf-8")
         secrets.extend(line.strip() for line in content.splitlines() if line.strip())
@@ -2420,9 +2673,19 @@ def analyze(
 ) -> tuple[Report, list[Extract]]:
     """Run every check against one PDF.
 
-    Returns the report and, when `want_extracts` is set, the recovered
-    text each layer yielded.
+    `secrets` is the text that must not survive anywhere, and is empty
+    for a run that only makes the structural checks. Returns the report
+    and, when `want_extracts` is set, the recovered text each layer
+    yielded.
+
+    Raises UsageError when a secret has nothing in it, and pikepdf's
+    PdfError when the file cannot be read at all. The blank secret is
+    refused here as well as in `load_secrets`, so that the guard belongs
+    to this function rather than to the command line: every document
+    contains text with nothing in it, so searching for it would report
+    every document as a failed redaction.
     """
+    reject_blank_secrets(secrets)
     report = Report(path=path)
     extracts: list[Extract] = []
     with pikepdf.open(path) as pdf:

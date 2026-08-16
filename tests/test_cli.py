@@ -47,6 +47,10 @@ class TestExitCodes:
             ("clean.pdf", 0),
             ("tagged.pdf", 0),
             ("smart_quotes.pdf", 0),
+            # A form that gives the page's own font name to a font of
+            # its own. Every character both fonts declare is drawn, so a
+            # reading that keeps the two apart has nothing to report.
+            ("rebound_font.pdf", 0),
             # A JPEG cannot be decoded here, and must not be reported as
             # a layer that could not be read -- every scan has one.
             ("image_stream.pdf", 0),
@@ -63,6 +67,9 @@ class TestExitCodes:
             ("form_xobject.pdf", 1),
             # Fonts this cannot read all the way, and one orphan.
             ("broken_fonts.pdf", 1),
+            # Drawing instructions that are not a content stream, which
+            # a parser hands back as no instructions at all.
+            ("broken_contents.pdf", 1),
             # Structures nested deeper than any walk here follows. The
             # address is in the file and out of reach, so the run must
             # report what it could not read rather than nothing at all.
@@ -189,6 +196,19 @@ class TestSecretSources:
         still match, and every document would still fail."""
         code = prc.main([str(fixtures / "fake_redacted.pdf"), "-s", SECRET, "-s", ""])
         assert code == prc.EXIT_USAGE
+
+    def test_a_blank_secret_is_refused_for_a_library_caller_too(
+        self, prc: ModuleType, fixtures: Path
+    ) -> None:
+        """The command line is not the only way in.
+
+        `analyze` is what anything embedding this calls, and text with
+        nothing in it matches every document there exactly as it would
+        from a terminal, so the guard belongs to the function rather
+        than to the argument parsing in front of it.
+        """
+        with pytest.raises(prc.UsageError, match="nothing in it"):
+            prc.analyze(fixtures / "clean.pdf", [""])
 
     def test_a_secret_of_ordinary_text_is_not_refused(
         self, prc: ModuleType, fixtures: Path

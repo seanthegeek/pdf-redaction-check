@@ -9,6 +9,18 @@ bump.
 
 ## [Unreleased]
 
+### Changed
+
+- A `--secret` with nothing in it, or with nothing but whitespace, is now a
+  usage error (exit code `4`) rather than a search. Text with nothing in it is
+  in every document ever written, so it reported every document as a failed
+  redaction; the shape it arrives in is a CI gate running `--secret "$NAME"`
+  with the variable unset. Blank lines in a `--secret-file` are still skipped,
+  because that file holds one secret per line and a line with nothing on it is
+  formatting rather than a request. The refusal belongs to `analyze` as well as
+  to the argument parsing in front of it, so anything embedding this gets the
+  same answer rather than a report convicting every document it is given.
+
 ### Fixed
 
 - Page text is now read through the font a `Q` puts back. The font is part of
@@ -18,36 +30,47 @@ bump.
   never drew, which can hide a font subset's real leftovers, and losing the
   ones it did draw, which reported a clean font as the remnant of a removed
   passage. A form's content is drawn inside a save of its own, so neither half
-  of a pair crosses into or out of one, and a `Q` with nothing left to restore
-  is reported rather than passed over.
+  of a pair crosses into or out of one, and a `Q` with no `q` left to restore
+  from is reported rather than passed over.
 - A `/Font` resource that is a number, and a `/ToUnicode` entry that is a
   number, are reported instead of ending the run. pikepdf hands a number back
   as a plain Python object, which has none of the methods a font is read with,
   so one of these used to raise part way through — printing no findings at all,
-  whatever else the document was carrying.
-- Every walk that stops at the depth limit now says where it gave up. The tag
-  tree, the object graph swept for string objects, forms drawn inside forms,
-  and the resources reached through them are all bounded, because a hostile
-  file can nest a structure forever; stopping quietly meant a document whose
-  content nobody could reach came back as a document with nothing in it. Two
-  more layers can now report something they could not read — the structure tree
-  and the string-object sweep — so seven of them can, rather than the five
-  listed under 0.1.0.
-- A form drawn twice from two different places is read both times when the two
-  share one `/Resources` dictionary. A drawing is now told apart by the stream
-  that drew it as well as by the innermost resources in effect there, because
-  neither is enough alone, and text the second drawing put on the page was
-  going missing from the page text.
-
-### Changed
-
-- A `--secret` with nothing in it, or with nothing but whitespace, is now a
-  usage error (exit code `4`) rather than a search. Text with nothing in it is
-  in every document ever written, so it reported every document as a failed
-  redaction; the shape it arrives in is a CI gate running `--secret "$NAME"`
-  with the variable unset. Blank lines in a `--secret-file` are still skipped,
-  because that file holds one secret per line and a line with nothing on it is
-  formatting rather than a request.
+  whatever else the document was carrying. Text drawn with such a resource is
+  now described as drawn with a name defined as something other than a font
+  dictionary, rather than as a name nothing defines: the resource is there, and
+  the report used to contradict the font check standing beside it.
+- Every walk that stops at the depth limit now says where it gave up, and the
+  two that had no limit have one. The six are the tag tree, the object graph
+  swept for string objects, forms drawn inside forms, the resources reached
+  through them, a font's chain of descendant fonts, and the tree the embedded
+  file names hang off. All six can be nested forever by a file built to do it;
+  the last two were bounded only by how many objects the file held, so a long
+  enough chain ended the run in a recursion error, printing a traceback where
+  the report belongs and exiting with the code that means "suspicious". The
+  other four stopped quietly, which meant a document whose content nobody could
+  reach came back as a document with nothing in it. Two more layers can now
+  report something they could not read — the structure tree and the
+  string-object sweep — so seven of them can, rather than the five listed under
+  0.1.0.
+- A form drawn twice is read both times when the two drawings differ in ways
+  the record of them used to miss. A drawing is now told apart by the form, the
+  font in effect — both the resource name and which font that name resolved to
+  — and the content stream that drew it. Two forms that share one `/Resources`
+  dictionary are drawn from different streams, and a form whose own resources
+  give the page's font name to a font of its own draws two different fonts
+  under the one name; either way, text the second drawing put on the page was
+  going missing from the page text, and the font that really did draw it was
+  then reported as carrying the remnants of a removed passage. A font
+  dictionary written out in place, rather than as an object of its own, has no
+  object number to be told apart by, so what stands in for one there is what
+  the font turns character codes into: two such fonts that draw different text
+  are two drawings, and two that draw the same text are one.
+- A page whose `/Contents` is not drawing instructions is reported rather than
+  read as a page that draws nothing. A content parser hands back no
+  instructions at all for a `/Contents` that is a number or a dictionary, and
+  passes over an array entry that is not a stream, so a document whose text
+  nobody could read used to end in "no evidence of surviving content".
 
 ## [0.1.0] - 2026-08-02
 
