@@ -1222,8 +1222,8 @@ def widths_charset(
         except TypeError:
             note(
                 problems,
-                f"/Widths entry {offset} is not a number, so the code it "
-                "describes was not inspected",
+                f"the /Widths entry for character code {start + offset} is "
+                "not a number, so that code was not inspected",
             )
             continue
         if size <= 0:
@@ -1613,6 +1613,14 @@ def draw_content(
     leaves the font in effect unchanged. It is reported rather than
     passed over, because from there on the text is read on the
     assumption that a reader would do the same.
+
+    The saved states are kept only to the same depth as everything else
+    here. A `q` costs two bytes and asks for a state to be kept, and
+    those two bytes compress to almost nothing, so a file of a few
+    kilobytes could otherwise ask for as much memory as the machine
+    has. Past the limit the state is not kept, and a `Q` that would
+    have taken one back leaves the font where it stands -- the same
+    thing that happens to a `Q` with no `q` at all.
     """
     # `found.drawn` stops a form that draws itself, but only a form that
     # is an object in its own right, which is the only kind a document
@@ -1624,15 +1632,27 @@ def draw_content(
     xobjects = resource_scope(scopes, "/XObject")
     decoders: dict[str, FontDecoder] = {}
     saved: list[FontState] = []
+    unkept = 0
+    unkept_restores = 0
     unrestored = 0
 
     for instruction in pikepdf.parse_content_stream(content):
         operator = str(instruction.operator)
         if operator == "q":
-            saved.append(font)
+            if len(saved) < MAX_DEPTH:
+                saved.append(font)
+            else:
+                unkept += 1
             continue
         if operator == "Q":
-            if saved:
+            # A Q pairs with the most recent q, kept or not, so the ones
+            # that went unkept are counted off first. Taking a state
+            # from the stack for one of them would restore a font from
+            # the wrong depth and leave every later restore off by one.
+            if unkept:
+                unkept -= 1
+                unkept_restores += 1
+            elif saved:
                 font = saved.pop()
             else:
                 unrestored += 1
@@ -1671,6 +1691,13 @@ def draw_content(
             "state from, which leaves the font in effect where a reader would "
             "leave it, so what the text after them spells could only be worked "
             "out on that assumption"
+        )
+    if unkept_restores:
+        found.problems.append(
+            f"{unkept_restores} Q operator(s) asked for a graphics state saved "
+            f"more than {MAX_DEPTH} q operators deep, which is further than "
+            "this keeps them, so the font in effect was left where it stood "
+            "and the text after them was read on that assumption"
         )
 
 
@@ -1761,7 +1788,7 @@ def content_problems(page: pikepdf.Page) -> list[str]:
     return [
         f"entry {position} of the page's drawing instructions (/Contents) array "
         "is not a content stream, so the text it draws was not inspected"
-        for position, item in enumerate(contents)
+        for position, item in enumerate(contents, start=1)
         if not isinstance(item, pikepdf.Stream)
     ]
 

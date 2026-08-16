@@ -756,6 +756,13 @@ class TestUnreadableFontDictionaries:
     def test_an_unreadable_widths_entry_is_named(
         self, prc: ModuleType, fixtures: Path
     ) -> None:
+        """The character code is named, not the position in the array.
+
+        A position would have to say whether it counted from zero, and
+        the code is what an operator would go looking for anyway. The
+        sample's /FirstChar is 65, and the bad entry is the one after
+        it, so the code is 66.
+        """
         report, _ = prc.analyze(fixtures / "broken_fonts.pdf", [])
         problems = [
             f
@@ -763,7 +770,7 @@ class TestUnreadableFontDictionaries:
             if f.location == "page 1 /FBadWidth" and "/Widths entry" in f.detail
         ]
         assert len(problems) == 1
-        assert "entry 1 is not a number" in problems[0].detail
+        assert "character code 66 is not a number" in problems[0].detail
         assert problems[0].severity is prc.Severity.WARNING
 
     def test_a_font_listed_as_its_own_descendant_terminates(
@@ -1106,6 +1113,73 @@ class TestDecodedPageText:
             visible = prc.extract_page_text(pdf)
         assert all(char in visible for char in "ÁÉÍ")
         assert not [char for char in "ÙŸŽ" if char in visible]
+
+    def test_saving_more_states_than_the_limit_is_reported(
+        self, prc: ModuleType
+    ) -> None:
+        """A `q` costs two bytes and asks for a saved state.
+
+        Those two bytes compress to almost nothing, so a file of a few
+        kilobytes could otherwise ask for as much memory as the machine
+        has. Past the limit the state is not kept, and the `Q` that
+        would have taken it back has to say so -- keeping the text but
+        saying the font it was read through is a guess.
+        """
+        with pikepdf.new() as pdf:
+            page = pdf.add_blank_page()
+            deep = prc.MAX_DEPTH + 5
+            page.Contents = pdf.make_stream(b"q " * deep + b"Q " * deep)
+            _, problems, _ = prc._page_text(page)
+        assert len(problems) == 1
+        assert "5 Q operator(s)" in problems[0]
+        assert str(prc.MAX_DEPTH) in problems[0]
+
+    def test_saving_up_to_the_limit_is_not_reported(self, prc: ModuleType) -> None:
+        """The negative half: the limit is not hit one save early.
+
+        Without this, moving the limit down would look like a fix for
+        the test above rather than a change in what the tool inspects.
+        """
+        with pikepdf.new() as pdf:
+            page = pdf.add_blank_page()
+            page.Contents = pdf.make_stream(
+                b"q " * prc.MAX_DEPTH + b"Q " * prc.MAX_DEPTH
+            )
+            _, problems, _ = prc._page_text(page)
+        assert problems == []
+
+    def test_a_restore_past_the_limit_does_not_shift_the_ones_below_it(
+        self, prc: ModuleType
+    ) -> None:
+        """A `Q` pairs with the most recent `q`, kept or not.
+
+        Matching a restore against a saved state that belongs to a
+        different depth would leave every restore after it off by one,
+        so the states that were dropped have to be counted off first.
+        The last `Q` here is the one that pairs with the first `q`, and
+        it has to put the original font back.
+        """
+        with pikepdf.new() as pdf:
+            page = pdf.add_blank_page()
+            over = prc.MAX_DEPTH + 3
+            page.Contents = pdf.make_stream(
+                b"/F1 12 Tf " + b"q " * over + b"Q " * over + b"<01> Tj"
+            )
+            page.Resources = pikepdf.Dictionary(
+                Font=pikepdf.Dictionary(
+                    F1=pikepdf.Dictionary(
+                        Type=pikepdf.Name("/Font"),
+                        Subtype=pikepdf.Name("/Type1"),
+                        BaseFont=pikepdf.Name("/Helvetica"),
+                        Encoding=pikepdf.Dictionary(
+                            Type=pikepdf.Name("/Encoding"),
+                            Differences=[1, pikepdf.Name("/x")],
+                        ),
+                    )
+                )
+            )
+            text, _, _ = prc._page_text(page)
+        assert text == "x"
 
     def test_a_form_that_rebinds_a_font_name_is_read_through_both_fonts(
         self, prc: ModuleType, fixtures: Path

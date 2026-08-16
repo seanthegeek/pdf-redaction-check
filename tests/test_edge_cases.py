@@ -222,7 +222,7 @@ class TestDrawingInstructionsThatAreNot:
         assert text == ""
         details = [f.detail for f in report.findings]
         assert len(details) == 2
-        assert [d for d in details if "entry 1 of the page's drawing" in d]
+        assert [d for d in details if "entry 2 of the page's drawing" in d]
         assert [d for d in details if "could not be parsed" in d]
 
     def test_an_array_entry_that_is_not_a_stream(
@@ -236,7 +236,7 @@ class TestDrawingInstructionsThatAreNot:
         )
         assert text == "drawn"
         assert len(report.findings) == 1
-        assert "entry 1 of the page's drawing instructions" in report.findings[0].detail
+        assert "entry 2 of the page's drawing instructions" in report.findings[0].detail
 
     @pytest.mark.parametrize("wrapped", [False, True])
     def test_a_page_with_ordinary_instructions_reports_nothing(
@@ -273,7 +273,7 @@ class TestDrawingInstructionsThatAreNot:
         report, _ = prc.analyze(fixtures / "broken_contents.pdf", [])
         content = [f for f in report.findings if f.check == prc.CONTENT_STREAM]
         assert [f.location for f in content] == ["page 1", "page 2"]
-        assert "entry 1 of the page's drawing instructions" in content[0].detail
+        assert "entry 2 of the page's drawing instructions" in content[0].detail
         assert "neither a content stream nor an array" in content[1].detail
         assert prc.verdict_code(report) == prc.EXIT_SUSPICIOUS
 
