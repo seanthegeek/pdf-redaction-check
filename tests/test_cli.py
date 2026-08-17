@@ -70,6 +70,11 @@ class TestExitCodes:
             # Drawing instructions that are not a content stream, which
             # a parser hands back as no instructions at all.
             ("broken_contents.pdf", 1),
+            # Compressed drawing instructions that stop early, which the
+            # PDF reader recovers what it can of rather than refusing.
+            # The font left holding the characters the lost instructions
+            # drew is a warning here, not the failure it looks like.
+            ("truncated_stream.pdf", 1),
             # Structures nested deeper than any walk here follows. The
             # address is in the file and out of reach, so the run must
             # report what it could not read rather than nothing at all.
@@ -304,7 +309,7 @@ class TestDumpOutput:
         assert "characters, not text" in out
 
     def test_nothing_recovered_says_so(self, prc: ModuleType) -> None:
-        rendered = prc.render_dump(Path("x.pdf"), "hidden", [])
+        rendered = prc.render_dump(Path("x.pdf"), "hidden", [], prc.PageTextCoverage())
         assert "(nothing recovered)" in rendered
 
     def test_json_carries_the_dump(
@@ -313,6 +318,7 @@ class TestDumpOutput:
         prc.main([str(fixtures / "tagged.pdf"), "--dump-all", "--json"])
         payload = json.loads(capsys.readouterr().out)
         assert payload["dump"]["mode"] == "all"
+        assert payload["dump"]["page_text_read_in_full"] is True
         layers = {e["layer"]: e for e in payload["dump"]["extracts"]}
         assert layers[prc.STRUCTURE_TREE]["hidden"] is True
         assert layers[prc.CONTENT_STREAM]["hidden"] is False
@@ -322,6 +328,71 @@ class TestDumpOutput:
     ) -> None:
         prc.main([str(fixtures / "clean.pdf"), "--json"])
         assert "dump" not in json.loads(capsys.readouterr().out)
+
+
+class TestTheDumpSaysWhatHiddenWasDecidedAgainst:
+    """Hidden is a comparison against the page text this run could read.
+
+    The report withdraws the inference that a font's leftovers are text
+    the document no longer draws when that page text is short of what
+    the pages draw. The dump makes the same comparison and must not go
+    on asserting what the report withdrew, so it says how much of the
+    page text it held -- while still listing every block, because text
+    that survived somewhere is evidence whatever the baseline was.
+    """
+
+    def test_the_json_says_the_page_text_fell_short(
+        self, prc: ModuleType, fixtures: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        prc.main([str(fixtures / "truncated_stream.pdf"), "--dump-hidden", "--json"])
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["dump"]["page_text_read_in_full"] is False
+        orphans = [
+            e for e in payload["dump"]["extracts"] if e["layer"] == prc.FONT_CHARSET
+        ]
+        assert len(orphans) == 1
+        assert orphans[0]["hidden"] is True
+
+    def test_an_unmeasured_dump_is_not_a_complete_one(self, prc: ModuleType) -> None:
+        """The negative half of the flag, for a caller that did not look."""
+        payload = prc.dump_to_json("hidden", [], "", None)
+        assert payload["page_text_read_in_full"] is False
+
+    def test_the_heading_carries_the_caveat(
+        self, prc: ModuleType, fixtures: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        prc.main([str(fixtures / "truncated_stream.pdf"), "--dump-hidden"])
+        out = capsys.readouterr().out
+        assert "trouble reading the data the pages draw from" in out
+        assert "hidden here means absent from the page text this could read" in out
+
+    def test_a_complete_reading_carries_no_caveat(
+        self, prc: ModuleType, fixtures: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The negative half: a whole page text is not qualified."""
+        prc.main([str(fixtures / "tagged.pdf"), "--dump-hidden"])
+        out = capsys.readouterr().out
+        assert "hidden here means" not in out
+
+    def test_an_unmeasured_render_says_nobody_looked(self, prc: ModuleType) -> None:
+        rendered = prc.render_dump(Path("x.pdf"), "hidden", [], None)
+        assert "never measured" in rendered
+
+    def test_a_dump_of_everything_has_no_hidden_claim_to_qualify(
+        self, prc: ModuleType, fixtures: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The same short page text, in the mode that marks nothing hidden.
+
+        `--dump-all` prints every recovered block whether the page text
+        accounts for it or not, so there is no claim under that heading
+        for the shortfall to weaken. The `--json` form of the same run
+        does mark each block, and carries the flag that says so.
+        """
+        prc.main([str(fixtures / "truncated_stream.pdf"), "--dump-all"])
+        assert "hidden here means" not in capsys.readouterr().out
+        prc.main([str(fixtures / "truncated_stream.pdf"), "--dump-all", "--json"])
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["dump"]["page_text_read_in_full"] is False
 
 
 class TestJSONFindings:

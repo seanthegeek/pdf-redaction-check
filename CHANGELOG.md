@@ -11,6 +11,45 @@ bump.
 
 ## [0.2.0] - 2026-08-16
 
+### Added
+
+- What the PDF reader says while it opens a file and reads its pages is now
+  reported, under `content-stream`. qpdf, which reads the file underneath this,
+  does not refuse one it can only partly recover: a stream whose compressed
+  data was cut short is decompressed as far as the data goes and handed over as
+  though that were the whole stream, with a warning left on the document
+  instead of an exception raised. Nothing else here would have noticed — the
+  parse succeeds, every instruction it did produce is read, and the page reads
+  exactly like one read to the end — so a page still showing the characters its
+  fonts declare was reported as a font full of leftovers, with a `CRITICAL` and
+  exit code `2`. A file cut short in transit is commoner than any of the
+  malformed shapes the rest of this work was built around. The warnings are
+  counted and the first named, the way every other count here is put, and
+  because they are about the file rather than about any one page they put the
+  whole page text in question: every font-subset finding in such a run is the
+  weaker of the two. `truncated_stream.pdf` is the new sample.
+
+  What the reader says about the *structure* of the file is reported
+  separately and goes no further. Opening a file reads its cross-reference
+  table, and a damaged one is put back together by searching the file for its
+  objects; the pages then read from what was recovered and still hand over
+  every instruction they hold. Treating that as a page text read short would
+  put this tool's main check behind a byte anyone can damage — one digit of an
+  offset, and a document whose fonts really are full of leftovers comes back as
+  a warning instead of a failure. The two are told apart by when they were
+  said: what the reader had to say before a page was read is about the
+  structure, and what it said while the pages were being read is about the data
+  they draw from.
+- The recovered-text dumps now say how much of the page text `hidden` was
+  decided against. `hidden` means absent from the page text this run could
+  read, for every layer, so a run that read less than the pages draw cannot
+  claim more than that — the report withdraws exactly that inference for the
+  font-subset layer, and the dump beside it used to go on asserting it. The
+  `--json` dump object carries `page_text_read_in_full`, and `--dump-hidden`
+  says it in words under its heading, where being hidden is what put a block in
+  the output. Every recovered block is still listed either way: text that
+  survived somewhere is evidence whatever the baseline was.
+
 ### Changed
 
 - A `--secret` with nothing in it, or with nothing but whitespace, is now a
@@ -44,11 +83,12 @@ bump.
   the same reason in the other direction: an entry that would not read may have
   selected another font or restored the graphics state, so from there on the
   text reads as text drawn with no font selected rather than through a font
-  this cannot show was still in effect. An instruction written across such a
-  join draws nothing rather than drawing the wrong characters. Both show up
-  among the counts of text this could not turn into characters. A page read
-  this way counts as one that was not read in full, so the bullet above applies
-  to its fonts.
+  this cannot show was still in effect. Text drawn that way shows up among the
+  counts of text this could not turn into characters. An instruction written
+  across such a join is split between two entries, so reading them apart draws
+  it in neither — it draws nothing rather than the wrong characters, and there
+  is nothing left of it to count. A page read this way counts as one that was
+  not read in full, so the bullet below applies to its fonts.
 - A font's leftover character mappings are no longer reported as a removed
   passage when the page text they were compared against could not be read in
   full. The font-subset check reads a character it cannot account for in the
@@ -58,13 +98,39 @@ bump.
   page still showing the characters in question, contradicting the
   `content-stream` warning printed three lines above it. The finding still
   fires and still lists every character; what changes is that it reports them
-  as absent from the page text this could read, names the pages that went
-  unread, and is a `WARNING` rather than a `CRITICAL`, because the evidence for
-  "the content is recoverable" went missing along with the page text. Any page
-  that could not be read in full has this effect on every font in the document,
-  not only on the fonts of that page, because the text a font is compared
-  against is every page's joined together. A document whose pages were all read
-  to the end is unaffected, and still convicts.
+  as absent from the page text this could read, says what fell short — how many
+  pages went unread and which one to start at, or that the PDF reader had
+  trouble with the data the pages draw from — and is a `WARNING` rather than a
+  `CRITICAL`, because the evidence for "the content is recoverable" went
+  missing along with the page text. Any page that could not be read in full has
+  this effect on every font in the document, not only on the fonts of that
+  page, because the text a font is compared against is every page's joined
+  together. A document whose pages were all read to the end is unaffected, and
+  still convicts.
+
+  What weakens the finding is text going unread, not a warning being printed.
+  Some `content-stream` warnings are about a page that was read to the end: a
+  `Q` operator with no `q` before it is malformed, and ISO 32000 section 8.4.4
+  leaves a reader nothing to restore from, so a reader carries on and so does
+  this — the warning records that the text after it was read on that
+  assumption, and every instruction on the page was still taken in. Each site
+  that loses text now says so for itself, instead of the report's findings and
+  the page-read-in-full signal both being derived from one list, because
+  deriving them handed anyone who could append two bytes a reader ignores a way
+  to talk this tool's main check down from `CRITICAL` to a
+  warning. How much of the page text a run holds is also no longer something a
+  caller can leave unsaid and be believed: `check_fonts` takes it as an
+  argument with no default, and a caller that says it did not measure gets the
+  weaker finding, where leaving it out used to select the stronger one. The
+  same argument reaches `render_dump` and `dump_to_json`, and `analyze` takes
+  one optional argument more, so anything embedding those four passes what it
+  measured or says it measured nothing.
+- The note about an array of content streams that would not read as one now
+  counts the entries that are content streams rather than all of them, and
+  describes them as read on their own rather than describing every entry that
+  way. Neither is what happens to an entry that is not a content stream: it is
+  handed to no parser, and the line beside this one already reports it by
+  position, so the old count contradicted the line printed beside it.
 - A page's drawing instructions are now read one at a time instead of all at
   once, so how many of them a page holds no longer decides what reading it
   costs. Instructions compress extremely well — a `q` is two bytes — so a

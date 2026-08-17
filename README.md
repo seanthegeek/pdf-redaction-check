@@ -180,19 +180,23 @@ outside the text layer reports under two names: `raw-objects` for stream data,
 - `raw-objects`: a stream whose declared filters could not be undone and that
   holds no picture, or that cannot be read at all;
 - `content-stream`: a page whose drawing instructions will not parse all the
-  way through, or a form drawn on the page whose own will not — either of which
-  costs the text drawn from the point they stopped at and not the text drawn
+  way through, or a form drawn on the page whose own will not — either of those
+  two costs the text drawn from the point it stopped at and not the text drawn
   before it; a page whose `/Contents` is an array of content streams that will
   not read as one, which is how a reader reads them, or an entry of such an
   array that will not read on its own either — see "Limitations"; a page whose
   `/Contents` is neither a content stream nor an array of them, or an entry of
-  that array that is not a content stream, either of
-  which a parser hands back no instructions for rather than refusing; a form
-  drawn by a name nothing defines; forms drawn inside one another more than 64
-  levels deep, which is where every walk here stops — see "Limitations"; text
-  drawn before any font was selected, with a font the resources in effect do not
-  define, with a name they define as something other than a font dictionary, or
-  with a character code that font does not map; a `Q` operator with no `q` left
+  that array that is not a content stream, either of which a parser hands back
+  no instructions for rather than refusing; what the PDF reader itself
+  reported, which is either a fault in the structure of the file, such as a
+  cross-reference table it had to rebuild, or trouble reading the data the
+  pages draw from, which is where a stream whose compressed data stops early
+  shows up — see "Limitations"; a form drawn by a name nothing defines; forms
+  drawn inside one another more than 64 levels deep, which is where every walk
+  here stops — see "Limitations"; text drawn before any font was selected, with
+  a font the resources in effect do not define, with a name they define as
+  something other than a font dictionary, or with a character code that font
+  does not map; a `Q` operator with no `q` left
   to restore a graphics state from, or one asking for a state saved more than
   64 `q` operators deep, which is as many as are kept, after either of which
   the text is read on the assumption that a reader would leave the font where
@@ -235,11 +239,14 @@ CRITICAL font-charset [page 1 /F1]: 6 character(s) mapped by the font subset but
 ```
 
 That inference needs the page text it compared against to be the whole of the
-page text. When any page could not be read in full — for any of the reasons
-listed under `content-stream` above — the same check reports what it observed
-instead, names the pages that went unread, and drops to a `WARNING`, because a
-character missing from a comparison this could not finish may be one the
-document is still showing:
+page text. When any of it went unread — for any of the reasons listed under
+`content-stream` above that cost text — the same check reports what it observed
+instead, says what fell short, and drops to a `WARNING`, because a character
+missing from a comparison this could not finish may be one the document is
+still showing. What fell short is put the way every other count here is: how
+many pages went unread and which one to start looking at, or that the PDF
+reader had trouble reading the data the pages draw from, which is about the
+file rather than any one page.
 
 ```text
 WARNING  font-charset [page 1 /F1]: 3 character(s) mapped by the font subset but absent from the page text this could read, in CMap order: 'ÁÂÃ' -- the text of page 1 could not be read in full, so these may be characters the document still shows that this run never saw, rather than characters removed from the content stream
@@ -249,6 +256,17 @@ Every character is still listed and the finding is still made; only the
 inference changes. It reaches every font in the document rather than only the
 fonts of the page that went unread, because the text a font is compared against
 is every page's joined together.
+
+What weakens it is text going unread, not a `content-stream` warning being
+printed. Two of those warnings are about a document that gave up all of its
+text. A `Q` operator with no `q` before it is malformed, and ISO 32000 section
+8.4.4 leaves a reader nothing to restore from, so a reader carries on and so
+does this — the warning says the text after it was read on that assumption, and
+every instruction on the page was still taken in. A cross-reference table the
+PDF reader had to rebuild is a fault in the structure of the file, and the
+pages read from what it recovered still handed over every instruction they
+hold. Were either of them enough, two bytes no reader acts on — or one digit of
+a byte offset — would talk this check down from `CRITICAL`.
 
 `--json` emits the same findings as an object, for a CI gate that needs to do
 more than branch on the exit code:
@@ -307,6 +325,7 @@ $ pdf-redaction-check tagged.pdf --dump-hidden --json
   ],
   "dump": {
     "mode": "hidden",
+    "page_text_read_in_full": true,
     "extracts": [
       {
         "layer": "structure-tree",
@@ -336,6 +355,18 @@ passage from a legitimate second copy of the page.
 
 `is_text` is false for font-subset extracts, which are characters rather than
 words — see the warning above.
+
+`hidden` says the text is absent from the page text this run could read, which
+is the same comparison the report makes and no stronger. `page_text_read_in_full`
+is what says how much that was: `false` means some of the text the pages draw
+went unread, so text marked hidden may be text the document is still showing. A
+gate that branches on `hidden` should read that field too, in either dump mode
+— `--dump-all` marks each block hidden or not as well, and carries the same
+field. The `--dump-hidden` text output says it in words under its heading,
+where being hidden is what put a block in the output; the text output of
+`--dump-all` marks no block hidden, so it has nothing there to qualify. Every
+recovered block is listed either way — text that survived somewhere is evidence
+whatever the baseline was.
 
 ### Exit codes
 
@@ -405,6 +436,26 @@ file is clean.
   it draws, which may be a character the page never showed, and nothing is
   reported. Prefer `--secret` on such files: the raw-object sweep works on
   bytes and does not depend on the font at all.
+- **A file the PDF reader could only partly read.** qpdf, which reads the file
+  underneath this, does not refuse one it can only partly recover. The common
+  shape is a stream whose compressed data was cut short — a file truncated in
+  transit — which it decompresses as far as the data goes and hands over as
+  though that were the whole stream, leaving a warning on the document rather
+  than raising. The parse of the page then succeeds, so nothing about the page
+  says it stopped short of the end. What it said is collected and reported
+  under `content-stream`, and because that is about the file rather than about
+  any one page it puts the whole page text in question: every font-subset
+  finding in such a run is the weaker of the two. What the lost bytes drew
+  cannot be recovered here, and this tool does not attempt to repair the file.
+  What the reader says about the *structure* of a file — a cross-reference
+  table it had to rebuild by searching the file for its objects — is reported
+  the same way and stops there, because a document put back together that way
+  still hands over every instruction its pages hold. The cost of one of those
+  is any object the search did not find: it is not in the document this
+  inspected, and nothing here can say what was in it. What the reader says is
+  collected up to the end of the page-text pass, so trouble it runs into later
+  — decompressing an attachment for the raw sweep, say — is not reported this
+  way; that stream is reported by the layer that could not read it.
 - **An array of content streams that will not read as one.** A page's drawing
   instructions can be an array of content streams, and ISO 32000 section 7.8.2
   makes them one stream, divided only at the boundaries between tokens — so a

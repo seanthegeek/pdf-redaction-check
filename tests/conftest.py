@@ -43,6 +43,7 @@ SAMPLE_NAMES = (
     "saved_state.pdf",
     "smart_quotes.pdf",
     "tagged.pdf",
+    "truncated_stream.pdf",
     "unapplied.pdf",
     "xmp.pdf",
 )

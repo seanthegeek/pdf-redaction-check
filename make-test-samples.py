@@ -43,6 +43,7 @@ and safe to paste into a bug report.
     smart_quotes.pdf     WinAnsi curly quotes, and nothing hidden
     broken_fonts.pdf     font dictionaries that cannot be read
     broken_contents.pdf  drawing instructions that are not a content stream
+    truncated_stream.pdf drawing instructions whose compressed data stops early
     form_xobject.pdf     page text drawn inside a Form XObject
     saved_state.pdf      the font a q saved and a Q put back
     rebound_font.pdf     a form that rebinds the font name the page uses
@@ -132,6 +133,9 @@ CAPTIONS = {
     "broken_contents.pdf": (
         "Sample broken_contents.pdf - drawing instructions that are not a stream"
     ),
+    "truncated_stream.pdf": (
+        "Sample truncated_stream.pdf - compressed instructions that stop early"
+    ),
     "form_xobject.pdf": "Sample form_xobject.pdf - text drawn inside a Form XObject",
     "saved_state.pdf": "Sample saved_state.pdf - a Q puts back the font a q saved",
     "rebound_font.pdf": (
@@ -187,6 +191,14 @@ DEEP_FORM_CODES = bytes(range(0xBC, 0xBF))
 # fonts declares: 0xE0 to 0xE2 are the letter a carrying a grave, an
 # acute and a circumflex accent. Nothing reaches these either.
 DEEP_DESCENDANT_CODES = bytes(range(0xE0, 0xE3))
+
+# The codes the truncated-stream sample draws past the point its
+# compressed data stops, in WinAnsiEncoding: 0xE8 to 0xEA are the letter
+# e carrying a grave, an acute and a circumflex accent. Nothing else on
+# that page draws them, so a font declaring exactly these declares three
+# characters the recovered page text cannot account for -- while the
+# page, read by anything holding the whole stream, still draws them.
+TRUNCATED_CODES = bytes(range(0xE8, 0xEB))
 
 # The two codes the operands of the costly-stream sample's show-text
 # instruction draw, in WinAnsiEncoding: 0xC5 is A with a ring above,
@@ -941,6 +953,51 @@ def build_broken_contents() -> None:
         pdf.save(SAMPLES / name)
 
 
+def build_truncated_stream() -> None:
+    """A page whose compressed drawing instructions stop part way.
+
+    qpdf, which reads the file underneath pikepdf, does not refuse a
+    Flate stream whose compressed data was cut short. It decompresses as
+    far as the data goes, hands back what it got as though that were the
+    whole stream, and leaves a warning on the document instead of
+    raising. Every instruction it did produce is read, so nothing about
+    the page looks unfinished -- which is what makes this the shape to
+    keep a fixture of. A file cut short in transit is far commoner than
+    any of the deliberately malformed shapes here.
+
+    The page's own instructions are left where they are, so the caption
+    still renders, and the drawing that is cut off is added after them:
+    three character codes drawn with a font that declares exactly those
+    three. The compressed data is cut in the middle of that instruction,
+    so what comes back stops before the operator that would have drawn
+    it. A run that took the recovered instructions for the whole page
+    would find a font declaring three characters the page text does not
+    account for, and call a page still showing them a failed redaction.
+    """
+    name = "truncated_stream.pdf"
+    letter_pdf(name, CAPTIONS[name], include_secret=False)
+    with pikepdf.open(SAMPLES / name, allow_overwriting_input=True) as pdf:
+        page = pdf.pages[0]
+        page["/Resources"]["/Font"]["/FTrunc"] = pdf.make_indirect(
+            widths_font(TRUNCATED_CODES[0], len(TRUNCATED_CODES))
+        )
+        # Compressed in two goes with a flush between them, so that the
+        # cut lands at a point decided here rather than wherever the
+        # compressor happened to put a boundary: everything written
+        # before the flush decompresses on its own, without any of what
+        # follows, and half of what follows is enough to leave the data
+        # stopping short.
+        compressor = zlib.compressobj()
+        kept = compressor.compress(page["/Contents"].read_bytes())
+        kept += compressor.flush(zlib.Z_FULL_FLUSH)
+        cut = compressor.compress(show_text("FTrunc", TRUNCATED_CODES, 640))
+        cut += compressor.flush()
+        stream = pikepdf.Stream(pdf, kept + cut[: len(cut) // 2])
+        stream.stream_dict["/Filter"] = pikepdf.Name("/FlateDecode")
+        page.obj["/Contents"] = pdf.make_indirect(stream)
+        pdf.save(SAMPLES / name)
+
+
 def widths_font(first: int, count: int) -> pikepdf.Dictionary:
     """Return a font dictionary declaring `count` consecutive codes.
 
@@ -1321,6 +1378,7 @@ def main() -> None:
     build_smart_quotes()
     build_broken_fonts()
     build_broken_contents()
+    build_truncated_stream()
     build_form_xobject()
     build_saved_state()
     build_rebound_font()

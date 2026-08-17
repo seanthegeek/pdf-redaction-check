@@ -118,10 +118,13 @@ class TestBrokenPages:
             pdf.save(path)
         report, _ = prc.analyze(path, [])
         content = [f for f in report.findings if f.check == prc.CONTENT_STREAM]
-        assert len(content) == 1
-        assert content[0].severity is prc.Severity.WARNING
-        assert content[0].location == "page 1"
-        assert "content stream could not be parsed" in content[0].detail
+        located = [f for f in content if f.location == "page 1"]
+        assert len(located) == 1
+        assert located[0].severity is prc.Severity.WARNING
+        assert "content stream could not be parsed" in located[0].detail
+        # qpdf has its own account of the same stream, which is about
+        # the file rather than about the page and is reported as such.
+        assert [f for f in content if "the PDF reader reported" in f.detail]
         assert prc.verdict_code(report) == prc.EXIT_SUSPICIOUS
 
     def test_page_without_resources(self, prc: ModuleType) -> None:
@@ -604,28 +607,31 @@ class TestFontFindingsAgainstAPartialBaseline:
     def test_extract_page_text_records_which_pages_it_could_not_finish(
         self, prc: ModuleType, tmp_path: Path
     ) -> None:
-        """The signal is collected where the problems are, so they agree.
+        """The signal is collected where the text goes unread.
 
-        A page is partial exactly when something about it was reported,
-        which is what stops the report and the font check contradicting
-        each other.
+        A page is partial when text it draws went unread, which is not
+        the same as something about it being reported -- see
+        `TestAPageReadToTheEndIsNotAPartialPage`.
         """
         path = self.build(tmp_path, PARTIAL_DRAWS_THEM, None, PARTIAL_DRAWS_NOTHING)
-        partial: list[int] = []
+        coverage = prc.PageTextCoverage()
         with pikepdf.open(path) as pdf:
-            text = prc.extract_page_text(pdf, None, partial)
+            text = prc.extract_page_text(pdf, None, coverage)
         assert PARTIAL_CHARS in text
-        assert partial == [2]
+        assert coverage.partial_pages == [2]
+        assert not coverage.complete
 
     def test_a_document_read_in_full_records_no_partial_pages(
         self, prc: ModuleType, tmp_path: Path
     ) -> None:
         """The negative half of the collector: nothing wrong, nothing said."""
         path = self.build(tmp_path, PARTIAL_DRAWS_THEM, PARTIAL_DRAWS_NOTHING)
-        partial: list[int] = []
+        coverage = prc.PageTextCoverage()
         with pikepdf.open(path) as pdf:
-            prc.extract_page_text(pdf, None, partial)
-        assert partial == []
+            prc.extract_page_text(pdf, None, coverage)
+        assert coverage.partial_pages == []
+        assert coverage.reader_problems == []
+        assert coverage.complete
 
     def test_nobody_has_to_collect_the_partial_pages(
         self, prc: ModuleType, tmp_path: Path
@@ -638,6 +644,537 @@ class TestFontFindingsAgainstAPartialBaseline:
         path = self.build(tmp_path, None)
         with pikepdf.open(path) as pdf:
             assert prc.extract_page_text(pdf) == ""
+
+    def test_a_caller_that_did_not_measure_gets_the_weaker_finding(
+        self, prc: ModuleType, tmp_path: Path
+    ) -> None:
+        """The two halves of the contract must not disagree by default.
+
+        `extract_page_text` collects nothing unless it is asked to, and
+        says so; a check handed that text and no measurement knows only
+        that nobody looked. Unmeasured is not read in full, so the
+        weaker finding is the one that follows -- an embedder wiring the
+        two together the way each of their docstrings allows must not be
+        told a document nobody could read is a failed redaction.
+        """
+        path = self.build(tmp_path, None, PARTIAL_DRAWS_NOTHING)
+        report = prc.Report(path=path)
+        with pikepdf.open(path) as pdf:
+            text = prc.extract_page_text(pdf)
+            prc.check_fonts(pdf, report, text, None)
+        findings = [f for f in report.findings if f.check == prc.FONT_CHARSET]
+        assert findings
+        for finding in findings:
+            assert finding.severity is prc.Severity.WARNING
+            assert "never measured" in finding.detail
+
+
+# Drawing instructions that select the font and draw none of its
+# characters, followed by a `Q` with no `q` anywhere before it. ISO
+# 32000 section 8.4.4 leaves a reader nothing to restore from, so it
+# leaves the graphics state alone and reads on; every instruction on the
+# page is still taken in.
+PARTIAL_DRAWS_NOTHING_THEN_RESTORES = PARTIAL_DRAWS_NOTHING + b"Q\n"
+
+
+class TestAPageReadToTheEndIsNotAPartialPage:
+    """Having something to report is not the same as having lost text.
+
+    The font-subset check reads a character it cannot account for as
+    consistent with a removed passage, and withdraws that inference when
+    the page text it compared against is short of what the pages draw.
+    What must decide that is text going unread, not the report being
+    non-empty: an unmatched `Q` is malformed and is reported, and the
+    reading still took in every instruction the page holds.
+
+    Deriving it from the report instead hands anyone who can add two
+    bytes to a file a way to talk the tool's main check down from
+    CRITICAL to a warning, without changing a mark a reader would put on
+    the page.
+    """
+
+    def orphan_findings(self, prc: ModuleType, path: Path) -> list[Any]:
+        """Return the font-subset findings a full run reports."""
+        report, _ = prc.analyze(path, [])
+        return [
+            f
+            for f in report.findings
+            if f.check == prc.FONT_CHARSET and "mapped by the font subset" in f.detail
+        ]
+
+    def test_an_unmatched_restore_is_reported_and_costs_no_text(
+        self, prc: ModuleType, tmp_path: Path
+    ) -> None:
+        """Reported, and still a page that was read to the end."""
+        path = TestFontFindingsAgainstAPartialBaseline().build(
+            tmp_path, PARTIAL_DRAWS_NOTHING_THEN_RESTORES
+        )
+        report = prc.Report(path=path)
+        coverage = prc.PageTextCoverage()
+        with pikepdf.open(path) as pdf:
+            prc.extract_page_text(pdf, report, coverage)
+        assert [f for f in report.findings if "no q left to restore" in f.detail]
+        assert coverage.partial_pages == []
+        assert coverage.complete
+
+    def test_the_font_finding_stays_critical_after_an_unmatched_restore(
+        self, prc: ModuleType, tmp_path: Path
+    ) -> None:
+        """The regression this class exists for, on a built document."""
+        path = TestFontFindingsAgainstAPartialBaseline().build(
+            tmp_path, PARTIAL_DRAWS_NOTHING_THEN_RESTORES
+        )
+        report, _ = prc.analyze(path, [])
+        findings = self.orphan_findings(prc, path)
+        assert len(findings) == 1
+        assert findings[0].severity is prc.Severity.CRITICAL
+        assert "consistent with text removed" in findings[0].detail
+        assert prc.verdict_code(report) == prc.EXIT_RECOVERABLE
+
+    def test_a_restore_appended_to_the_committed_sample_changes_nothing(
+        self, prc: ModuleType, fixtures: Path, tmp_path: Path
+    ) -> None:
+        """The same regression on the sample the check is named for.
+
+        Two bytes a reader ignores, appended to the drawing instructions
+        of the document this tool exists to catch. The verdict has to be
+        the one the untouched sample earns.
+        """
+        path = tmp_path / "orphan_font_with_a_restore.pdf"
+        with pikepdf.open(fixtures / "orphan_font.pdf") as pdf:
+            page = pdf.pages[0]
+            drawn = page["/Contents"].read_bytes()
+            page.obj["/Contents"] = pdf.make_indirect(pdf.make_stream(drawn + b"\nQ\n"))
+            pdf.save(path)
+        report, _ = prc.analyze(path, [])
+        findings = self.orphan_findings(prc, path)
+        assert len(findings) == 1
+        assert findings[0].severity is prc.Severity.CRITICAL
+        assert prc.verdict_code(report) == prc.EXIT_RECOVERABLE
+
+    def test_a_restore_of_a_state_past_the_limit_does_count_as_unread(
+        self, prc: ModuleType, tmp_path: Path
+    ) -> None:
+        """The other half of the `q`/`Q` pair, which really does lose it.
+
+        A `Q` asking for a state saved deeper than the tool keeps them
+        is not a reader's problem but this tool's: the state is gone, so
+        the font in effect after it may be the wrong one and the text
+        read through it may be the wrong characters.
+        """
+        deep = b"q " * (prc.MAX_DEPTH + 1) + b"Q "
+        path = TestFontFindingsAgainstAPartialBaseline().build(
+            tmp_path, deep + PARTIAL_DRAWS_NOTHING
+        )
+        coverage = prc.PageTextCoverage()
+        with pikepdf.open(path) as pdf:
+            prc.extract_page_text(pdf, None, coverage)
+        assert coverage.partial_pages == [1]
+
+    def test_operands_passed_over_count_as_unread(
+        self, prc: ModuleType, tmp_path: Path
+    ) -> None:
+        """An operand that was dropped may have carried text."""
+        crowded = b"BT /F1 12 Tf " + b"<01> " * (prc.MAX_OPERANDS + 1) + b"Tj ET\n"
+        path = TestFontFindingsAgainstAPartialBaseline().build(tmp_path, crowded)
+        coverage = prc.PageTextCoverage()
+        with pikepdf.open(path) as pdf:
+            prc.extract_page_text(pdf, None, coverage)
+        assert coverage.partial_pages == [1]
+
+
+class TestEverySiteThatLosesTextSaysSo:
+    """The invariant the whole partial-page signal rests on.
+
+    A page is recorded as read short when text it draws went unread,
+    and each place that loses text sets that for itself rather than the
+    caller deriving it from the report. A site that forgets to leaves
+    the page looking whole, and the font-subset check then reads the
+    characters that page never gave up as characters the document no
+    longer draws -- a `CRITICAL` and exit code 2 on a page still
+    showing them. So each site needs a page that ends up on the list
+    because of it and nothing else.
+
+    Ten places in the tool set that signal, and five of them are
+    covered here. Four by the table below: bytes a page draws that no
+    font turned into characters, which is one place reached by two
+    shapes of resource; a character code the font in effect has no
+    mapping for; a form drawn by a name nothing defines; and a form
+    whose own instructions will not parse. The fifth is forms nested
+    past the walk, which has a test of its own because nothing about
+    the page itself goes wrong there.
+
+    The other five are covered where the documents that reach them are
+    built: a page whose own instructions will not parse, in
+    `TestFontFindingsAgainstAPartialBaseline`; an entry of a /Contents
+    array that will not parse, and the joined parse that sent the
+    entries to be read apart, both in
+    `TestAContentsArrayReadOneEntryAtATime`; and the two counts a
+    stream keeps -- operands passed over, and a `Q` asking for a saved
+    state past the limit -- in the class above.
+    """
+
+    def page(self, pdf: pikepdf.Pdf, body: bytes) -> None:
+        """Add one page drawing `body`, with the resources these need.
+
+        `/F1` draws code 1 as a character of its own and has no glyph
+        for code 4, which is a control code in its base encoding.
+        `/FNumber` is a font resource that is a number rather than a
+        font. `/FmBroken` is a form whose declared filter will not run.
+        Nothing defines `/FGone` or `/FmGone`.
+        """
+        broken = pdf.make_stream(b"BT /F1 12 Tf <01> Tj ET\n")
+        broken["/Type"] = pikepdf.Name("/XObject")
+        broken["/Subtype"] = pikepdf.Name("/Form")
+        broken["/BBox"] = [0, 0, 200, 200]
+        broken["/Filter"] = pikepdf.Name("/FlateDecode")
+        page = pdf.add_blank_page()
+        page.Resources = pikepdf.Dictionary(
+            Font=pikepdf.Dictionary(
+                F1=pikepdf.Dictionary(
+                    Type=pikepdf.Name("/Font"),
+                    Subtype=pikepdf.Name("/Type1"),
+                    BaseFont=pikepdf.Name("/Helvetica"),
+                    Encoding=pikepdf.Dictionary(
+                        Type=pikepdf.Name("/Encoding"),
+                        Differences=[1, pikepdf.Name("/Aacute")],
+                    ),
+                ),
+                FNumber=42,
+            ),
+            XObject=pikepdf.Dictionary(FmBroken=pdf.make_indirect(broken)),
+        )
+        page.Contents = pdf.make_stream(body)
+
+    def chain(self, pdf: pikepdf.Pdf, depth: int) -> pikepdf.Object:
+        """Return the outermost form of a chain `depth` forms long.
+
+        The innermost draws a character; every other one draws the form
+        below it, so a walk that stops part way down loses that
+        character and nothing else.
+        """
+        below: pikepdf.Object | None = None
+        for _ in range(depth):
+            body = b"BT /F1 12 Tf <01> Tj ET\n" if below is None else b"/FmDeep Do\n"
+            stream = pdf.make_stream(body)
+            stream["/Type"] = pikepdf.Name("/XObject")
+            stream["/Subtype"] = pikepdf.Name("/Form")
+            stream["/BBox"] = [0, 0, 200, 200]
+            if below is not None:
+                stream["/Resources"] = pikepdf.Dictionary(
+                    XObject=pikepdf.Dictionary(FmDeep=below)
+                )
+            below = pdf.make_indirect(stream)
+        assert below is not None
+        return below
+
+    def coverage_of(self, prc: ModuleType, pdf: pikepdf.Pdf) -> Any:
+        """Return what reading the pages of `pdf` measured."""
+        coverage = prc.PageTextCoverage()
+        prc.extract_page_text(pdf, None, coverage)
+        return coverage
+
+    @pytest.mark.parametrize(
+        ("body", "why"),
+        [
+            pytest.param(
+                b"BT /FGone 12 Tf <01> Tj ET\n",
+                "bytes drawn with a font name nothing defines",
+                id="undefined-font",
+            ),
+            pytest.param(
+                b"BT /FNumber 12 Tf <01> Tj ET\n",
+                "bytes drawn with a name defined as something else",
+                id="unusable-font",
+            ),
+            pytest.param(
+                b"BT /F1 12 Tf <04> Tj ET\n",
+                "a character code the font has no mapping for",
+                id="unmapped-code",
+            ),
+            pytest.param(
+                b"/FmGone Do\n",
+                "a form drawn by a name nothing defines",
+                id="undefined-form",
+            ),
+            pytest.param(
+                b"/FmBroken Do\n",
+                "a form whose own instructions will not parse",
+                id="unparsable-form",
+            ),
+        ],
+    )
+    def test_the_page_is_recorded_as_read_short(
+        self, prc: ModuleType, body: bytes, why: str
+    ) -> None:
+        with pikepdf.new() as pdf:
+            self.page(pdf, body)
+            coverage = self.coverage_of(prc, pdf)
+        assert coverage.partial_pages == [1], why
+
+    def test_forms_nested_past_the_walk_are_text_the_page_drew(
+        self, prc: ModuleType
+    ) -> None:
+        """The one shape with nothing to report about the page itself.
+
+        The walk gives up rather than failing, so the page's own
+        instructions parse to the end and every font resolves. What is
+        below the limit is still text the page draws.
+        """
+        with pikepdf.new() as pdf:
+            self.page(pdf, b"/FmDeep Do\n")
+            page = pdf.pages[0]
+            page["/Resources"]["/XObject"]["/FmDeep"] = self.chain(
+                pdf, prc.MAX_DEPTH + 2
+            )
+            coverage = self.coverage_of(prc, pdf)
+        assert coverage.partial_pages == [1]
+
+    def test_a_page_that_gives_up_none_of_its_text_is_not_recorded(
+        self, prc: ModuleType
+    ) -> None:
+        """The negative half: the same resources, drawn properly.
+
+        Without it, a signal that fired for every page would pass every
+        test above while saying nothing at all.
+        """
+        with pikepdf.new() as pdf:
+            self.page(pdf, b"BT /F1 12 Tf <01> Tj ET\n")
+            coverage = self.coverage_of(prc, pdf)
+        assert coverage.partial_pages == []
+        assert coverage.complete
+
+
+class TestAStreamWhoseCompressedDataStopsEarly:
+    """The reader recovers what it can and says so somewhere else.
+
+    qpdf does not raise on a Flate stream whose compressed data was cut
+    short: it decompresses as far as the data goes, hands the result
+    over as though it were the whole stream, and leaves a warning on the
+    document. The parse succeeds, so nothing about the page says it was
+    read short of the end -- and a font declaring the characters the
+    lost instructions drew looks exactly like a font full of leftovers.
+
+    A file cut short in transit is far commoner than any of the
+    deliberately malformed shapes elsewhere in this file, which is why
+    the corpus carries one.
+    """
+
+    def test_the_sample_reports_what_the_reader_said(
+        self, prc: ModuleType, fixtures: Path
+    ) -> None:
+        report, _ = prc.analyze(fixtures / "truncated_stream.pdf", [])
+        reader = [
+            f
+            for f in report.findings
+            if f.check == prc.CONTENT_STREAM
+            and "while the pages were being read" in f.detail
+        ]
+        assert len(reader) == 1
+        assert reader[0].severity is prc.Severity.WARNING
+        # The file is what had trouble, not any one page of it.
+        assert reader[0].location == ""
+
+    def test_the_font_finding_is_the_weaker_one(
+        self, prc: ModuleType, fixtures: Path
+    ) -> None:
+        """The whole point: the page is still showing those characters."""
+        report, _ = prc.analyze(fixtures / "truncated_stream.pdf", [])
+        findings = [
+            f
+            for f in report.findings
+            if f.check == prc.FONT_CHARSET and "mapped by the font subset" in f.detail
+        ]
+        assert len(findings) == 1
+        assert findings[0].severity is prc.Severity.WARNING
+        assert "the PDF reader had trouble" in findings[0].detail
+        assert "consistent with text removed" not in findings[0].detail
+        assert prc.verdict_code(report) == prc.EXIT_SUSPICIOUS
+
+    def test_the_page_itself_is_not_recorded_as_partial(
+        self, prc: ModuleType, fixtures: Path
+    ) -> None:
+        """Nothing about the page went wrong, which is the difficulty.
+
+        The doubt is document-wide, so it is recorded that way rather
+        than pinned on a page that read to the end of what it was given.
+        """
+        coverage = prc.PageTextCoverage()
+        with pikepdf.open(fixtures / "truncated_stream.pdf") as pdf:
+            prc.extract_page_text(pdf, None, coverage)
+        assert coverage.partial_pages == []
+        assert len(coverage.reader_problems) == 1
+        assert not coverage.complete
+
+    def test_the_warnings_are_taken_once(self, prc: ModuleType, fixtures: Path) -> None:
+        """Asking pikepdf for them clears them, so one caller asks.
+
+        A second reading of the same open document sees nothing, which
+        is why the tool drains them where it reads the pages rather than
+        wherever an answer is wanted. The reading is what produces them:
+        a stream nobody has decompressed yet has said nothing wrong.
+        """
+        with pikepdf.open(fixtures / "truncated_stream.pdf") as pdf:
+            assert prc.drain_reader_problems(pdf) == []
+            coverage = prc.PageTextCoverage()
+            prc.extract_page_text(pdf, None, coverage)
+            assert coverage.reader_problems
+            assert prc.drain_reader_problems(pdf) == []
+
+    def test_a_sound_file_leaves_the_reader_nothing_to_say(
+        self, prc: ModuleType, fixtures: Path
+    ) -> None:
+        """The negative half, on the sample with nothing wrong with it."""
+        with pikepdf.open(fixtures / "clean.pdf") as pdf:
+            prc.extract_page_text(pdf)
+            assert prc.drain_reader_problems(pdf) == []
+
+    def test_a_note_about_nothing_is_refused(self, prc: ModuleType) -> None:
+        with pytest.raises(ValueError, match="at least one problem"):
+            prc.reader_problems_note([])
+
+    def test_the_note_counts_them_and_names_the_first(self, prc: ModuleType) -> None:
+        note = prc.reader_problems_note(["first trouble", "second trouble"])
+        assert "2 problem(s)" in note
+        assert "first trouble" in note
+        assert "second trouble" not in note
+
+
+class TestAFileTheReaderHadToPutBackTogether:
+    """A damaged cross-reference table is not a page text read short.
+
+    qpdf puts a file whose table is damaged back together by searching
+    it for its objects, and says so. The pages then read from what it
+    recovered and hand over every instruction they hold, so the page
+    text is the whole of what those pages draw.
+
+    Treating that as a reason to doubt the page text would put the
+    tool's main check behind a byte anyone can damage: one digit of an
+    offset, and a document whose fonts really are full of leftovers
+    comes back as a warning instead of a failure. It is reported as
+    what it is -- a fault of the file -- and the font check is left
+    alone.
+
+    Which entry is damaged decides nothing, and that is what these
+    exercise. qpdf reads an object when something asks for it, so
+    damaging the entry for an object it wants while opening the file
+    and damaging the entry for one it does not want until a page is
+    drawn produce the same warnings at two different moments. Telling
+    the two kinds apart by when they arrived would put the second in
+    the wrong one, which is why the tool asks for every object before
+    it reads a page.
+    """
+
+    def damaged(self, fixtures: Path, tmp_path: Path, entry: int) -> Path:
+        """Return the orphaned-font sample with one xref entry broken.
+
+        `entry` is the object number whose offset is damaged. The table
+        lists one 20-byte entry per object, in object order, starting
+        after the `0 N` line that says how many there are.
+        """
+        raw = (fixtures / "orphan_font.pdf").read_bytes()
+        header = re.search(rb"\nxref\n0 (\d+)\n", raw)
+        assert header is not None, "the sample must carry a plain xref table"
+        start = header.end()
+        rows = [raw[start + n * 20 : start + (n + 1) * 20] for n in range(entry + 1)]
+        # One digit of the offset, which is enough to send the reader
+        # somewhere the object is not.
+        row = bytearray(rows[entry])
+        row[3] = ord("9") if row[3] != ord("9") else ord("1")
+        path = tmp_path / f"damaged_xref_{entry}.pdf"
+        path.write_bytes(
+            raw[:start]
+            + b"".join(rows[:entry])
+            + bytes(row)
+            + raw[start + (entry + 1) * 20 :]
+        )
+        return path
+
+    @pytest.mark.parametrize(
+        ("entry", "when"),
+        [
+            pytest.param(4, "wanted while the file is opened", id="eager"),
+            pytest.param(9, "wanted only when a page is drawn", id="lazy"),
+        ],
+    )
+    def test_the_damage_is_reported(
+        self, prc: ModuleType, fixtures: Path, tmp_path: Path, entry: int, when: str
+    ) -> None:
+        report, _ = prc.analyze(self.damaged(fixtures, tmp_path, entry), [])
+        structural = [
+            f
+            for f in report.findings
+            if "problem(s) with the structure of the file" in f.detail
+        ]
+        assert len(structural) == 1, when
+        assert structural[0].severity is prc.Severity.WARNING
+        assert structural[0].check == prc.CONTENT_STREAM
+        assert structural[0].location == ""
+        assert [
+            f for f in report.findings if "while the pages were being read" in f.detail
+        ] == []
+
+    @pytest.mark.parametrize("entry", [4, 9])
+    def test_the_font_finding_is_still_the_strong_one(
+        self, prc: ModuleType, fixtures: Path, tmp_path: Path, entry: int
+    ) -> None:
+        """The regression this class exists for."""
+        path = self.damaged(fixtures, tmp_path, entry)
+        report, _ = prc.analyze(path, [])
+        findings = [
+            f
+            for f in report.findings
+            if f.check == prc.FONT_CHARSET and "mapped by the font subset" in f.detail
+        ]
+        assert len(findings) == 1
+        assert findings[0].severity is prc.Severity.CRITICAL
+        assert "consistent with text removed" in findings[0].detail
+        assert prc.verdict_code(report) == prc.EXIT_RECOVERABLE
+
+    @pytest.mark.parametrize("entry", [4, 9])
+    def test_the_page_text_is_recorded_as_whole(
+        self, prc: ModuleType, fixtures: Path, tmp_path: Path, entry: int
+    ) -> None:
+        """Nothing about the pages was in doubt, so nothing is recorded."""
+        coverage = prc.PageTextCoverage()
+        with pikepdf.open(self.damaged(fixtures, tmp_path, entry)) as pdf:
+            text = prc.extract_page_text(pdf, None, coverage)
+        assert SECRET not in text
+        assert coverage.partial_pages == []
+        assert coverage.reader_problems == []
+        assert coverage.complete
+
+    def test_objects_that_cannot_all_be_reached_are_described(
+        self, prc: ModuleType, fixtures: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A walk of the objects that gives up is input, not a crash.
+
+        Asking for every object is what tells a damaged table from
+        trouble reading a page. A file so far gone that the asking
+        itself stops leaves the rest of the run to say what it can,
+        which means saying that this is what it was working from.
+        """
+
+        def stop(_self: Any) -> Any:
+            raise pikepdf.PdfError("the objects ran out")
+
+        monkeypatch.setattr(type(pikepdf.new()), "objects", property(stop))
+        report = prc.Report(path=fixtures / "clean.pdf")
+        with pikepdf.open(fixtures / "clean.pdf") as pdf:
+            prc.extract_page_text(pdf, report)
+        assert [f for f in report.findings if "could not all be read" in f.detail]
+
+    def test_a_structure_note_about_nothing_is_refused(self, prc: ModuleType) -> None:
+        with pytest.raises(ValueError, match="at least one problem"):
+            prc.structure_problems_note([])
+
+    def test_the_structure_note_counts_them_and_names_the_first(
+        self, prc: ModuleType
+    ) -> None:
+        note = prc.structure_problems_note(["first damage", "second damage"])
+        assert "2 problem(s)" in note
+        assert "first damage" in note
+        assert "second damage" not in note
 
 
 class TestAContentsArrayReadOneEntryAtATime:
@@ -739,6 +1276,43 @@ class TestAContentsArrayReadOneEntryAtATime:
         text, _ = self.read(prc, path)
         assert text == self.DRAWN
 
+    def test_a_joined_parse_that_stopped_is_itself_text_gone_unread(
+        self, prc: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The fallback cannot prove it recovered what the join held.
+
+        The entries here are both readable on their own, so nothing the
+        second pass meets has anything to report -- and the joined parse
+        that a reader would make still stopped. An instruction written
+        across the join it stopped at is split between two entries and
+        is drawn by neither reading, so the page is one this did not
+        read in full whatever the entries gave up.
+
+        No document in the corpus separates the two: a joined parse
+        stops because an entry will not decode or is not a stream, and
+        both of those are reported in their own right. The failure is
+        injected for that reason -- without it, the flag could be
+        deleted and nothing would notice until a file arrived that
+        needed it.
+        """
+
+        def stopped(*args: Any, **kwargs: Any) -> None:
+            raise pikepdf.PdfError("the joined parse stopped")
+
+        path = self.build(
+            tmp_path, b"BT /FA 12 Tf <01> Tj ET\n", b"BT /FA 12 Tf <02> Tj ET\n"
+        )
+        monkeypatch.setattr(prc, "draw_content", stopped)
+        coverage = prc.PageTextCoverage()
+        report = prc.Report(path=path)
+        with pikepdf.open(path) as pdf:
+            text = prc.extract_page_text(pdf, report, coverage)
+        # Both entries were read apart, and neither had anything to say.
+        assert text == self.DRAWN[:2]
+        assert [d for d in self.details(report) if "read as one stream" in d]
+        assert [d for d in self.details(report) if "on its own either" in d] == []
+        assert coverage.partial_pages == [1]
+
     def test_the_entry_that_could_not_be_read_is_named_by_object(
         self, prc: ModuleType, tmp_path: Path
     ) -> None:
@@ -766,10 +1340,10 @@ class TestAContentsArrayReadOneEntryAtATime:
         font-subset check convicting a document on this reading.
         """
         path = self.build(tmp_path, b"BT /FA 12 Tf <010203> Tj ET\n", None)
-        partial: list[int] = []
+        coverage = prc.PageTextCoverage()
         with pikepdf.open(path) as pdf:
-            prc.extract_page_text(pdf, None, partial)
-        assert partial == [1]
+            prc.extract_page_text(pdf, None, coverage)
+        assert coverage.partial_pages == [1]
 
     def test_the_font_selected_in_one_entry_decodes_the_next(
         self, prc: ModuleType, tmp_path: Path
@@ -993,6 +1567,13 @@ class TestAContentsArrayReadOneEntryAtATime:
         not_a_stream = [d for d in self.details(report) if "entry 3" in d]
         assert len(not_a_stream) == 1
         assert "is not a content stream" in not_a_stream[0]
+        # And the note beside it counts what was read on its own, which
+        # is the two content streams and not the number: an array of
+        # three said to hold three content streams would contradict the
+        # line above saying the third is not one.
+        joined = [d for d in self.details(report) if "read as one stream" in d]
+        assert len(joined) == 1
+        assert "an array holding 2 content stream(s)" in joined[0]
 
 
 # One line of drawing instructions, for the pages that are meant to be
@@ -1066,12 +1647,11 @@ class TestDrawingInstructionsThatAreNot:
         """Both shapes a parser answers with nothing for."""
         text, report = self.read(prc, tmp_path, build)
         assert text == ""
-        assert len(report.findings) == 1
-        finding = report.findings[0]
-        assert finding.severity is prc.Severity.WARNING
-        assert finding.check == prc.CONTENT_STREAM
-        assert finding.location == "page 1"
-        assert "neither a content stream nor an array of them" in finding.detail
+        located = [f for f in report.findings if f.location == "page 1"]
+        assert len(located) == 1
+        assert located[0].severity is prc.Severity.WARNING
+        assert located[0].check == prc.CONTENT_STREAM
+        assert "neither a content stream nor an array of them" in located[0].detail
 
     def test_a_bad_array_entry_is_still_named_when_the_rest_will_not_parse(
         self, prc: ModuleType, tmp_path: Path
@@ -1098,7 +1678,7 @@ class TestDrawingInstructionsThatAreNot:
 
         text, report = self.read(prc, tmp_path, build)
         assert text == ""
-        details = [f.detail for f in report.findings]
+        details = [f.detail for f in report.findings if f.location == "page 1"]
         assert len(details) == 3
         assert [d for d in details if "entry 2 of the page's drawing" in d]
         assert [d for d in details if "read as one stream they stopped" in d]
@@ -1114,8 +1694,9 @@ class TestDrawingInstructionsThatAreNot:
             lambda pdf: pikepdf.Array([pdf.make_stream(DRAWS_TEXT), 42]),
         )
         assert text == "drawn"
-        assert len(report.findings) == 1
-        assert "entry 2 of the page's drawing instructions" in report.findings[0].detail
+        located = [f for f in report.findings if f.location == "page 1"]
+        assert len(located) == 1
+        assert "entry 2 of the page's drawing instructions" in located[0].detail
 
     @pytest.mark.parametrize("wrapped", [False, True])
     def test_a_page_with_ordinary_instructions_reports_nothing(
@@ -1151,9 +1732,13 @@ class TestDrawingInstructionsThatAreNot:
         """
         report, _ = prc.analyze(fixtures / "broken_contents.pdf", [])
         content = [f for f in report.findings if f.check == prc.CONTENT_STREAM]
-        assert [f.location for f in content] == ["page 1", "page 2"]
-        assert "entry 2 of the page's drawing instructions" in content[0].detail
-        assert "neither a content stream nor an array" in content[1].detail
+        located = [f for f in content if f.location]
+        assert [f.location for f in located] == ["page 1", "page 2"]
+        assert "entry 2 of the page's drawing instructions" in located[0].detail
+        assert "neither a content stream nor an array" in located[1].detail
+        # qpdf passes over both shapes with a warning of its own, which
+        # is about the file and so carries no page.
+        assert [f for f in content if not f.location and "PDF reader" in f.detail]
         assert prc.verdict_code(report) == prc.EXIT_SUSPICIOUS
 
 
@@ -2152,10 +2737,10 @@ class TestStreamsBuiltToCost:
     parser's business, which the README says under "Limitations".
     """
 
-    def read(
-        self, prc: ModuleType, contents: bytes
-    ) -> tuple[str, list[str], list[str]]:
-        """Read one page of `contents` drawn with a font of known letters.
+    def read(self, prc: ModuleType, contents: bytes) -> Any:
+        """Return the `PageReading` for one page of `contents`.
+
+        The font it is drawn with maps two codes to known letters.
 
         Codes 1 and 2 are control codes in every base encoding, so what
         they spell is decided entirely by this /Differences array.
@@ -2196,14 +2781,14 @@ class TestStreamsBuiltToCost:
         throw away exactly the text on the screen and keep the padding
         in front of it.
         """
-        text, problems, _ = self.read(
+        reading = self.read(
             prc,
             b"BT /F1 12 Tf " + b"<01> " * 3 + b"<02> " * prc.MAX_OPERANDS + b"Tj ET",
         )
-        assert text == "b" * prc.MAX_OPERANDS
-        assert len(problems) == 1
-        assert "3 operand(s)" in problems[0]
-        assert str(prc.MAX_OPERANDS) in problems[0]
+        assert reading.text == "b" * prc.MAX_OPERANDS
+        assert len(reading.problems) == 1
+        assert "3 operand(s)" in reading.problems[0]
+        assert str(prc.MAX_OPERANDS) in reading.problems[0]
 
     def test_operands_up_to_the_limit_are_all_read(self, prc: ModuleType) -> None:
         """The negative half: the limit is not hit one operand early.
@@ -2211,11 +2796,11 @@ class TestStreamsBuiltToCost:
         Without this, moving the limit down would look like a fix for
         the test above rather than a change in what the tool reads.
         """
-        text, problems, _ = self.read(
+        reading = self.read(
             prc, b"BT /F1 12 Tf " + b"<01> " * prc.MAX_OPERANDS + b"Tj ET"
         )
-        assert text == "a" * prc.MAX_OPERANDS
-        assert problems == []
+        assert reading.text == "a" * prc.MAX_OPERANDS
+        assert reading.problems == []
 
     def test_a_stream_of_nothing_but_operands_says_what_it_dropped(
         self, prc: ModuleType
@@ -2232,11 +2817,11 @@ class TestStreamsBuiltToCost:
         written to an instruction that already holds as many as are read
         asserts an instruction this stream never wrote.
         """
-        text, problems, _ = self.read(prc, b"<01> " * (prc.MAX_OPERANDS + 6))
-        assert text == ""
-        assert len(problems) == 1
-        assert "6 operand(s)" in problems[0]
-        assert "waiting for an operator" in problems[0]
+        reading = self.read(prc, b"<01> " * (prc.MAX_OPERANDS + 6))
+        assert reading.text == ""
+        assert len(reading.problems) == 1
+        assert "6 operand(s)" in reading.problems[0]
+        assert "waiting for an operator" in reading.problems[0]
 
     def test_operands_are_counted_for_the_instruction_they_belong_to(
         self, prc: ModuleType
@@ -2248,12 +2833,12 @@ class TestStreamsBuiltToCost:
         stopped being per-instruction and started being per-stream.
         """
         half = prc.MAX_OPERANDS // 2
-        text, problems, _ = self.read(
+        reading = self.read(
             prc,
             b"BT /F1 12 Tf " + b"<01> " * half + b"Tj " + b"<02> " * half + b"Tj ET",
         )
-        assert text == "a" * half + "b" * half
-        assert problems == []
+        assert reading.text == "a" * half + "b" * half
+        assert reading.problems == []
 
     def test_an_inline_image_leaves_the_text_around_it_alone(
         self, prc: ModuleType
@@ -2265,14 +2850,14 @@ class TestStreamsBuiltToCost:
         object of its own, and `EI`. Losing count of the operands around
         any of those would change what the text on either side spells.
         """
-        text, problems, _ = self.read(
+        reading = self.read(
             prc,
             b"BT /F1 12 Tf <01> Tj ET\n"
             b"BI /W 2 /H 2 /CS /G /BPC 8 ID \x00\x11\x22\x33 EI\n"
             b"BT <02> Tj ET\n",
         )
-        assert text == "ab"
-        assert problems == []
+        assert reading.text == "ab"
+        assert reading.problems == []
 
     def test_the_data_of_an_inline_image_is_not_read_as_text(
         self, prc: ModuleType
@@ -2372,7 +2957,7 @@ class TestStreamsBuiltToCost:
                 XObject=pikepdf.Dictionary(Fm0=pdf.make_indirect(form))
             )
             page.Contents = pdf.make_stream(b"q /Fm0 Do Q")
-            _, problems, _ = prc._page_text(page)
+            problems = prc._page_text(page).problems
         assert [p for p in problems if "6 operand(s)" in p]
         assert [
             p for p in problems if "the form drawn as /Fm0 could not be parsed" in p
@@ -2511,6 +3096,46 @@ class TestProblemNotes:
         """
         with pytest.raises(ValueError, match="at least one page"):
             prc.partial_pages_note([])
+
+    def test_the_shortfall_names_the_pages_that_went_unread(
+        self, prc: ModuleType
+    ) -> None:
+        coverage = prc.PageTextCoverage(partial_pages=[2])
+        assert prc.shortfall_note(coverage) == (
+            "the text of page 2 could not be read in full"
+        )
+
+    def test_the_shortfall_names_the_reader_when_that_is_what_it_was(
+        self, prc: ModuleType
+    ) -> None:
+        """A document-wide doubt has no page to point at."""
+        coverage = prc.PageTextCoverage(reader_problems=["cut short"])
+        assert prc.shortfall_note(coverage) == (
+            "the PDF reader had trouble reading the data the pages draw from"
+        )
+
+    def test_the_shortfall_says_both_when_both_happened(self, prc: ModuleType) -> None:
+        coverage = prc.PageTextCoverage(
+            partial_pages=[2, 5], reader_problems=["cut short"]
+        )
+        note = prc.shortfall_note(coverage)
+        assert "2 pages, the first of them page 2" in note
+        assert "trouble reading the data the pages draw from besides" in note
+
+    def test_an_unmeasured_shortfall_says_that_nobody_looked(
+        self, prc: ModuleType
+    ) -> None:
+        """Unmeasured is not read in full, and is not reported as it."""
+        assert prc.shortfall_note(None) == (
+            "how much of the page text this holds was never measured"
+        )
+
+    def test_a_shortfall_note_about_a_whole_page_text_is_refused(
+        self, prc: ModuleType
+    ) -> None:
+        """Nothing fell short, so the caller built the wrong finding."""
+        with pytest.raises(ValueError, match="fell short"):
+            prc.shortfall_note(prc.PageTextCoverage())
 
     def test_text_shown_as_an_array(self, prc: ModuleType, tmp_path: Path) -> None:
         """TJ takes an array of strings and kerning numbers."""

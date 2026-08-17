@@ -701,12 +701,38 @@ class TestOrphanSeverity:
             font_declaring(pdf, "/FTwo", ord("a"), 2)
             font_declaring(pdf, "/FThree", ord("x"), 3)
             report = prc.Report(path=Path("x.pdf"))
-            prc.check_fonts(pdf, report, visible_text="")
+            prc.check_fonts(pdf, report, "", prc.PageTextCoverage())
         by_location = {f.location: f for f in report.findings}
         assert by_location["page 1 /FTwo"].severity is prc.Severity.WARNING
         assert "2 character(s)" in by_location["page 1 /FTwo"].detail
         assert by_location["page 1 /FThree"].severity is prc.Severity.CRITICAL
         assert "3 character(s)" in by_location["page 1 /FThree"].detail
+
+    def test_a_caller_that_measured_nothing_gets_a_warning_either_way(
+        self, prc: ModuleType
+    ) -> None:
+        """The threshold only applies once the baseline is known to be whole.
+
+        The same two fonts as above, on both sides of the threshold,
+        checked against a page text nobody measured: three characters
+        absent from a text of unknown extent is not three characters the
+        document no longer draws, and neither is two. The test above is
+        the control -- same fonts, same empty text, coverage that says
+        the pages were read to the end, and a `CRITICAL` for the font
+        that declares three.
+        """
+        with pikepdf.new() as pdf:
+            page = pdf.add_blank_page()
+            page["/Resources"] = pikepdf.Dictionary(Font=pikepdf.Dictionary())
+            font_declaring(pdf, "/FTwo", ord("a"), 2)
+            font_declaring(pdf, "/FThree", ord("x"), 3)
+            report = prc.Report(path=Path("x.pdf"))
+            prc.check_fonts(pdf, report, "", None)
+        by_location = {f.location: f for f in report.findings}
+        for location in ("page 1 /FTwo", "page 1 /FThree"):
+            assert by_location[location].severity is prc.Severity.WARNING
+            assert "never measured" in by_location[location].detail
+            assert "consistent with text removed" not in by_location[location].detail
 
     def test_the_committed_corpus_covers_both_sides(
         self, prc: ModuleType, fixtures: Path
@@ -1209,7 +1235,7 @@ class TestDecodedPageText:
             page = pdf.add_blank_page()
             deep = prc.MAX_DEPTH + 5
             page.Contents = pdf.make_stream(b"q " * deep + b"Q " * deep)
-            _, problems, _ = prc._page_text(page)
+            problems = prc._page_text(page).problems
         assert len(problems) == 1
         assert "5 Q operator(s)" in problems[0]
         assert str(prc.MAX_DEPTH) in problems[0]
@@ -1225,7 +1251,7 @@ class TestDecodedPageText:
             page.Contents = pdf.make_stream(
                 b"q " * prc.MAX_DEPTH + b"Q " * prc.MAX_DEPTH
             )
-            _, problems, _ = prc._page_text(page)
+            problems = prc._page_text(page).problems
         assert problems == []
 
     def test_a_restore_past_the_limit_does_not_shift_the_ones_below_it(
@@ -1258,7 +1284,7 @@ class TestDecodedPageText:
                     )
                 )
             )
-            text, _, _ = prc._page_text(page)
+            text = prc._page_text(page).text
         assert text == "x"
 
     def test_a_form_that_rebinds_a_font_name_is_read_through_both_fonts(
