@@ -197,6 +197,16 @@ someone's address is still in a document.
   observed, never by dropping a layer, capping the number of reported findings,
   or downgrading a severity to make output tidier. If a check is too noisy to be
   useful, that is a design conversation with the author, not a threshold tweak.
+- **Anything that makes a check say less is something a document can arrange.**
+  Softening a finding when the evidence is thinner is legitimate — it is the
+  "more precise about what it observed" rule above — and it is also a lever the
+  document can pull. Derive the softening from what was demonstrably *lost*:
+  bytes unread, a walk that stopped, a state that could not be restored. Never
+  derive it from "something was reported about this page", because a file can
+  arrange to be reported about. A `Q` with no `q` to restore from is reported
+  and costs nothing, and appending one took a leaking document from FAILED down
+  to suspicious. For every such condition, work out the cheapest edit that trips
+  it, and write the test that pins the answer.
 - **Adding a layer to the tool means adding it to the docs.** The README's
   "What it checks" table and its "Limitations" section together define what a
   clean result means. A new or removed check that does not update both leaves
@@ -306,6 +316,13 @@ coverage. Five disguises:
 The defects that author-side reviews miss are rarely inside one artifact — they
 are relations between two individually-correct places.
 
+- **Reproducing the symptom does not establish the cause.** Before naming the
+  code responsible, instrument the boundary and watch the data cross it. "The
+  text went missing, and this function is where it went missing" is a
+  hypothesis; the callback that never fired is the evidence. This matters most
+  when handing the work to someone else — briefing a reviewer or a subagent on
+  an unverified cause spends their effort on the wrong code, and a careful one
+  will come back having disproved the brief rather than fixed the defect.
 - **When fixing one half of a contract, grep for the other half**: write↔read
   against the type contract, comment↔declaration, a docstring guarantee↔every
   statement in its scope, a UI string↔the docs naming it. Here the standing
@@ -358,7 +375,18 @@ are relations between two individually-correct places.
   `fail_under` value in `pyproject.toml`, with branch coverage enabled — an `if`
   whose false path never runs is untested even when every line has executed. New
   code lands with the tests that cover both directions of its branches, or the
-  threshold comes down deliberately and in the same commit.
+  threshold comes down deliberately and in the same commit. What it measures is
+  the branches that were *written*. It says nothing about the input classes
+  nobody thought to write a branch for — a library handing back a plain Python
+  number where an object was assumed, the far side of a limit, an argument with
+  nothing in it. A green 100% is the floor for new code, not evidence the code
+  was thought about.
+- **A fix aimed at a quantity is not done until the quantity is measured
+  again.** Tests prove the code changed; only the measurement proves the
+  problem moved. Bounding a list that really was unbounded is the right change
+  and can still be two percent of the cost — take the number before and after,
+  and when it barely moves, the cause is somewhere else and the work has not
+  started yet.
 - **Cover CI's gates, not just its commands.** Patch coverage corresponds to no
   replayable workflow command, so command-replay never asks "does a test execute
   every new line?" — compare coverage's missing-lines report against the diff
