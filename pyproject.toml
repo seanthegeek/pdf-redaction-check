@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pdf-redaction-check"
-version = "0.1.0"
+version = "0.2.0"
 description = "Verify that a PDF redaction actually removed the content, instead of just covering it up."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -23,6 +23,15 @@ classifiers = [
     "Topic :: Security",
     "Topic :: Text Processing :: Filters",
 ]
+# The tool imports one private name, pikepdf._core.StreamParser, which
+# reads a content stream one object at a time rather than building a
+# list of every instruction in it. That class, Page.parse_contents and
+# Object._parse_stream are all present in every release this floor
+# allows -- the suite passes on 8.0.0 and on 10.11.0, and on the 8.x,
+# 9.x and 10.x releases in between that were spot-checked. The floor is
+# deliberately no lower: 7.x happens to work today, but nothing here
+# tests it and a private name is not something to assume about a
+# release the project does not claim to support.
 dependencies = ["pikepdf>=8"]
 
 [project.optional-dependencies]

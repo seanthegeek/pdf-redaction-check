@@ -31,7 +31,8 @@ may imply otherwise.
   `pdf-redaction-check` command
 - `build.sh` — creates `.venv` if absent, then builds the sdist and wheel into
   the gitignored `dist/`
-- `.github/workflows/ci.yml` — tests, coverage gate, lint, and build
+- `.github/workflows/ci.yml` — tests, oldest-pikepdf test, coverage gate, lint,
+  and build
 - `.github/workflows/release.yml` — publishes to PyPI when a GitHub release is
   published; manual runs go to TestPyPI
 - `.vscode/tasks.json` — makes `build.sh` the default VSCode build task
@@ -340,9 +341,11 @@ are relations between two individually-correct places.
 ### Verify what CI enforces, not a plausible subset
 
 - **Run CI's literal commands from the repo root** — read
-  `.github/workflows/ci.yml`. Its four jobs are tests across Python 3.11–3.14, a
-  coverage gate, lint (ruff, pyright, markdownlint), and a build that installs
-  the wheel and runs the console script. Run `pyright` with the virtualenv
+  `.github/workflows/ci.yml`. Its five jobs are tests across Python 3.11–3.14,
+  the same suite against the oldest pikepdf `pyproject.toml` allows, a coverage
+  gate, lint (ruff, pyright, markdownlint), and a build that installs the wheel
+  and runs the console script. A local run uses whatever pikepdf is installed,
+  so it cannot tell you what the floor job does. Run `pyright` with the virtualenv
   activated: it resolves imports from the active interpreter, and an
   unactivated run reports every third-party import as missing — noise that
   looks like a real failure. When repo-wide runs are noisy because of untracked

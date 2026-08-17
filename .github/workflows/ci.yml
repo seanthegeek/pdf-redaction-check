@@ -36,6 +36,67 @@ jobs:
       - name: Test
         run: pytest
 
+  floor:
+    name: Oldest supported pikepdf
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The oldest Python this project supports, because the oldest
+      # pikepdf it supports has no wheels for the newest ones -- pip
+      # would try to build it from source and fail on missing qpdf
+      # headers.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Read the floor out of pyproject.toml rather than repeating it
+      # here. A version written in two places is a version that will
+      # disagree with itself.
+      - name: Work out the declared floor
+        id: floor
+        run: |
+          version=$(python -c "
+          import pathlib, re, tomllib
+          deps = tomllib.loads(
+              pathlib.Path('pyproject.toml').read_text()
+          )['project']['dependencies']
+          spec = next(d for d in deps if re.match(r'^pikepdf\b', d))
+          floor = re.search(r'>=\s*([0-9][0-9.]*)', spec).group(1)
+          parts = floor.split('.')
+          print('.'.join(parts + ['0'] * (3 - len(parts))))
+          ")
+          echo "Declared floor: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install with the floor pinned
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+          python -m pip install "pikepdf==${{ steps.floor.outputs.version }}"
+
+      # Without this the job is worthless: if the pin silently resolved
+      # to something newer, the suite would pass against a version this
+      # job claims to have tested and did not.
+      - name: Confirm the floor is what got installed
+        run: |
+          python - <<'PY'
+          import os
+          import pikepdf
+
+          wanted = os.environ["WANTED"]
+          if pikepdf.__version__ != wanted:
+              raise SystemExit(
+                  f"asked for pikepdf {wanted}, got {pikepdf.__version__}"
+              )
+          print(f"testing against pikepdf {pikepdf.__version__}")
+          PY
+        env:
+          WANTED: ${{ steps.floor.outputs.version }}
+
+      - name: Test
+        run: pytest
+
   coverage:
     name: Coverage gate
     runs-on: ubuntu-latest

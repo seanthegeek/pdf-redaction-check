@@ -47,6 +47,10 @@ class TestExitCodes:
             ("clean.pdf", 0),
             ("tagged.pdf", 0),
             ("smart_quotes.pdf", 0),
+            # A form that gives the page's own font name to a font of
+            # its own. Every character both fonts declare is drawn, so a
+            # reading that keeps the two apart has nothing to report.
+            ("rebound_font.pdf", 0),
             # A JPEG cannot be decoded here, and must not be reported as
             # a layer that could not be read -- every scan has one.
             ("image_stream.pdf", 0),
@@ -63,12 +67,33 @@ class TestExitCodes:
             ("form_xobject.pdf", 1),
             # Fonts this cannot read all the way, and one orphan.
             ("broken_fonts.pdf", 1),
+            # Drawing instructions that are not a content stream, which
+            # a parser hands back as no instructions at all.
+            ("broken_contents.pdf", 1),
+            # Compressed drawing instructions that stop early, which the
+            # PDF reader recovers what it can of rather than refusing.
+            # The font left holding the characters the lost instructions
+            # drew is a warning here, not the failure it looks like.
+            ("truncated_stream.pdf", 1),
+            # Structures nested deeper than any walk here follows. The
+            # address is in the file and out of reach, so the run must
+            # report what it could not read rather than nothing at all.
+            ("deep_nesting.pdf", 1),
+            # Drawing instructions built to cost more memory than the
+            # file does: an instruction carrying more operands than are
+            # kept, and a form drawn five hundred times by a name
+            # nothing defines.
+            ("costly_stream.pdf", 1),
             # A stream that will not decompress: a layer of this
             # document nothing here could read, on a run given no
             # secret to look for.
             ("cleartext_stream.pdf", 1),
             ("unapplied.pdf", 2),
             ("orphan_font.pdf", 2),
+            # The font a q saved and a Q put back: the leftovers the
+            # page really carries, once its text is read through the
+            # font a reader would have in effect.
+            ("saved_state.pdf", 2),
         ],
     )
     def test_structural_run(
@@ -154,6 +179,53 @@ class TestSecretSources:
             prc.main([str(fixtures / "clean.pdf"), "--secret-file", str(listing)]) == 0
         )
 
+    @pytest.mark.parametrize("blank", ["", " ", "\t", "\n", "   \t "])
+    def test_a_blank_secret_is_a_usage_error(
+        self,
+        prc: ModuleType,
+        fixtures: Path,
+        blank: str,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """A blank secret is in every document, so it convicts every one.
+
+        The shape this arrives in is a CI gate running `--secret
+        "$NAME"` with the variable unset. Matching it would report a
+        clean document as a failed redaction; dropping it silently would
+        report an unchecked document as a clean one. Neither is an
+        answer, so the invocation is refused.
+        """
+        code = prc.main([str(fixtures / "clean.pdf"), "--secret", blank])
+        assert code == prc.EXIT_USAGE
+        assert "--secret" in capsys.readouterr().err
+
+    def test_a_blank_secret_is_refused_beside_a_real_one(
+        self, prc: ModuleType, fixtures: Path
+    ) -> None:
+        """One good secret does not make the blank one harmless: it would
+        still match, and every document would still fail."""
+        code = prc.main([str(fixtures / "fake_redacted.pdf"), "-s", SECRET, "-s", ""])
+        assert code == prc.EXIT_USAGE
+
+    def test_a_blank_secret_is_refused_for_a_library_caller_too(
+        self, prc: ModuleType, fixtures: Path
+    ) -> None:
+        """The command line is not the only way in.
+
+        `analyze` is what anything embedding this calls, and text with
+        nothing in it matches every document there exactly as it would
+        from a terminal, so the guard belongs to the function rather
+        than to the argument parsing in front of it.
+        """
+        with pytest.raises(prc.UsageError, match="nothing in it"):
+            prc.analyze(fixtures / "clean.pdf", [""])
+
+    def test_a_secret_of_ordinary_text_is_not_refused(
+        self, prc: ModuleType, fixtures: Path
+    ) -> None:
+        """The negative half: only a secret with nothing in it is."""
+        assert prc.main([str(fixtures / "clean.pdf"), "-s", SECRET]) == 0
+
     def test_missing_secret_file_is_a_usage_error(
         self,
         prc: ModuleType,
@@ -237,7 +309,7 @@ class TestDumpOutput:
         assert "characters, not text" in out
 
     def test_nothing_recovered_says_so(self, prc: ModuleType) -> None:
-        rendered = prc.render_dump(Path("x.pdf"), "hidden", [])
+        rendered = prc.render_dump(Path("x.pdf"), "hidden", [], prc.PageTextCoverage())
         assert "(nothing recovered)" in rendered
 
     def test_json_carries_the_dump(
@@ -246,6 +318,7 @@ class TestDumpOutput:
         prc.main([str(fixtures / "tagged.pdf"), "--dump-all", "--json"])
         payload = json.loads(capsys.readouterr().out)
         assert payload["dump"]["mode"] == "all"
+        assert payload["dump"]["page_text_read_in_full"] is True
         layers = {e["layer"]: e for e in payload["dump"]["extracts"]}
         assert layers[prc.STRUCTURE_TREE]["hidden"] is True
         assert layers[prc.CONTENT_STREAM]["hidden"] is False
@@ -255,6 +328,71 @@ class TestDumpOutput:
     ) -> None:
         prc.main([str(fixtures / "clean.pdf"), "--json"])
         assert "dump" not in json.loads(capsys.readouterr().out)
+
+
+class TestTheDumpSaysWhatHiddenWasDecidedAgainst:
+    """Hidden is a comparison against the page text this run could read.
+
+    The report withdraws the inference that a font's leftovers are text
+    the document no longer draws when that page text is short of what
+    the pages draw. The dump makes the same comparison and must not go
+    on asserting what the report withdrew, so it says how much of the
+    page text it held -- while still listing every block, because text
+    that survived somewhere is evidence whatever the baseline was.
+    """
+
+    def test_the_json_says_the_page_text_fell_short(
+        self, prc: ModuleType, fixtures: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        prc.main([str(fixtures / "truncated_stream.pdf"), "--dump-hidden", "--json"])
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["dump"]["page_text_read_in_full"] is False
+        orphans = [
+            e for e in payload["dump"]["extracts"] if e["layer"] == prc.FONT_CHARSET
+        ]
+        assert len(orphans) == 1
+        assert orphans[0]["hidden"] is True
+
+    def test_an_unmeasured_dump_is_not_a_complete_one(self, prc: ModuleType) -> None:
+        """The negative half of the flag, for a caller that did not look."""
+        payload = prc.dump_to_json("hidden", [], "", None)
+        assert payload["page_text_read_in_full"] is False
+
+    def test_the_heading_carries_the_caveat(
+        self, prc: ModuleType, fixtures: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        prc.main([str(fixtures / "truncated_stream.pdf"), "--dump-hidden"])
+        out = capsys.readouterr().out
+        assert "trouble reading the data the pages draw from" in out
+        assert "hidden here means absent from the page text this could read" in out
+
+    def test_a_complete_reading_carries_no_caveat(
+        self, prc: ModuleType, fixtures: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The negative half: a whole page text is not qualified."""
+        prc.main([str(fixtures / "tagged.pdf"), "--dump-hidden"])
+        out = capsys.readouterr().out
+        assert "hidden here means" not in out
+
+    def test_an_unmeasured_render_says_nobody_looked(self, prc: ModuleType) -> None:
+        rendered = prc.render_dump(Path("x.pdf"), "hidden", [], None)
+        assert "never measured" in rendered
+
+    def test_a_dump_of_everything_has_no_hidden_claim_to_qualify(
+        self, prc: ModuleType, fixtures: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The same short page text, in the mode that marks nothing hidden.
+
+        `--dump-all` prints every recovered block whether the page text
+        accounts for it or not, so there is no claim under that heading
+        for the shortfall to weaken. The `--json` form of the same run
+        does mark each block, and carries the flag that says so.
+        """
+        prc.main([str(fixtures / "truncated_stream.pdf"), "--dump-all"])
+        assert "hidden here means" not in capsys.readouterr().out
+        prc.main([str(fixtures / "truncated_stream.pdf"), "--dump-all", "--json"])
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["dump"]["page_text_read_in_full"] is False
 
 
 class TestJSONFindings:

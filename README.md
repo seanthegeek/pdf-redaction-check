@@ -171,21 +171,59 @@ even for the samples in this repository, and more from a word processor.
 `INFO` lines are not problems. They record what each layer inspected. Anything
 that could not be read at all is reported as a `WARNING`, naming the page or
 object it concerns where there is one to name, which is what keeps a check that
-found nothing distinguishable from a check that could not run. Five layers can
-say it:
+found nothing distinguishable from a check that could not run. Seven check
+names can carry one — not the same seven as the layers in the table above.
+Nothing is ever reported this way under `annotations`, and the sweep for text
+outside the text layer reports under two names: `raw-objects` for stream data,
+`raw-strings` for the string objects no other layer claims. The seven are:
 
-- a stream whose declared filters could not be undone and that holds no
-  picture, or that cannot be read at all;
-- a page whose drawing instructions will not parse; a form drawn on it that
-  will not parse, or that is drawn by a name nothing defines; or text drawn
-  before any font was selected, or with a font the resources in effect do not
-  define, or with a character code that font does not map;
-- a font whose character map, `/Widths` array, or `/FirstChar` cannot be read,
-  or a descendant font entry that is not a font dictionary;
-- an `/Info` entry that is not a dictionary, or an XMP metadata packet that
-  cannot be read, so that metadata was not inspected;
-- a `/Names` entry that is not a dictionary, so embedded attachments could not
-  be looked for.
+- `raw-objects`: a stream whose declared filters could not be undone and that
+  holds no picture, or that cannot be read at all;
+- `content-stream`: a page whose drawing instructions will not parse all the
+  way through, or a form drawn on the page whose own will not — either of those
+  two costs the text drawn from the point it stopped at and not the text drawn
+  before it; a page whose `/Contents` is an array of content streams that will
+  not read as one, which is how a reader reads them, or an entry of such an
+  array that will not read on its own either — see "Limitations"; a page whose
+  `/Contents` is neither a content stream nor an array of them, or an entry of
+  that array that is not a content stream, either of which a parser hands back
+  no instructions for rather than refusing; what the PDF reader itself
+  reported, which is either a fault in the structure of the file, such as a
+  cross-reference table it had to rebuild, or trouble reading the data the
+  pages draw from, which is where a stream whose compressed data stops early
+  shows up — see "Limitations"; a form drawn by a name nothing defines; forms
+  drawn inside one another more than 64 levels deep, which is where every walk
+  here stops — see "Limitations"; text drawn before any font was selected, with
+  a font the resources in effect do not define, with a name they define as
+  something other than a font dictionary, or with a character code that font
+  does not map; a `Q` operator with no `q` left
+  to restore a graphics state from, or one asking for a state saved more than
+  64 `q` operators deep, which is as many as are kept, after either of which
+  the text is read on the assumption that a reader would leave the font where
+  it stands; or more operands written in a row than the 64 this holds waiting
+  for an operator — see "Limitations" — which is more operands than any
+  instruction a reader draws with, so the ones written first were passed over
+  and the ones written last, which are the ones an operator would use, were
+  kept;
+- `font-charset`: a font whose character map, `/Widths` array, or `/FirstChar`
+  cannot be read, a `/DescendantFonts` entry that is not an array or that holds
+  something other than a font dictionary, a `/Font` resource that is not a font
+  dictionary at all, a `/ToUnicode` entry
+  that is not the stream a character map lives in, forms nested past that same
+  limit, so that the fonts inside them were never reached, or a font's chain of
+  descendant fonts nested past it, so that what the font at the bottom declares
+  was never read;
+- `structure-tree`: a tagged-PDF structure tree nested past that limit, so the
+  tags below it were not inspected;
+- `raw-strings`: an object graph nested past that limit, so the string objects
+  below it were not swept — reported when a dump mode or a `--secret` asked for
+  that sweep, which is when it runs;
+- `metadata`: an `/Info` entry that is not a dictionary, or an XMP metadata
+  packet that cannot be read, so that metadata was not inspected;
+- `attachments`: a `/Names` entry that is not a dictionary, so embedded
+  attachments could not be looked for, or a tree of embedded file names nested
+  past that limit, so the attachments below it were not listed — that one, like
+  the string sweep, is reported when a dump mode or a `--secret` runs it.
 
 A document with nothing to report ends on:
 
@@ -199,6 +237,36 @@ it states its own uncertainty:
 ```text
 CRITICAL font-charset [page 1 /F1]: 6 character(s) mapped by the font subset but absent from visible text, in CMap order: '742Evg' -- consistent with text removed from the content stream but not the font subset
 ```
+
+That inference needs the page text it compared against to be the whole of the
+page text. When any of it went unread — for any of the reasons listed under
+`content-stream` above that cost text — the same check reports what it observed
+instead, says what fell short, and drops to a `WARNING`, because a character
+missing from a comparison this could not finish may be one the document is
+still showing. What fell short is put the way every other count here is: how
+many pages went unread and which one to start looking at, or that the PDF
+reader had trouble reading the data the pages draw from, which is about the
+file rather than any one page.
+
+```text
+WARNING  font-charset [page 1 /F1]: 3 character(s) mapped by the font subset but absent from the page text this could read, in CMap order: 'ÁÂÃ' -- the text of page 1 could not be read in full, so these may be characters the document still shows that this run never saw, rather than characters removed from the content stream
+```
+
+Every character is still listed and the finding is still made; only the
+inference changes. It reaches every font in the document rather than only the
+fonts of the page that went unread, because the text a font is compared against
+is every page's joined together.
+
+What weakens it is text going unread, not a `content-stream` warning being
+printed. Two of those warnings are about a document that gave up all of its
+text. A `Q` operator with no `q` before it is malformed, and ISO 32000 section
+8.4.4 leaves a reader nothing to restore from, so a reader carries on and so
+does this — the warning says the text after it was read on that assumption, and
+every instruction on the page was still taken in. A cross-reference table the
+PDF reader had to rebuild is a fault in the structure of the file, and the
+pages read from what it recovered still handed over every instruction they
+hold. Were either of them enough, two bytes no reader acts on — or one digit of
+a byte offset — would talk this check down from `CRITICAL`.
 
 `--json` emits the same findings as an object, for a CI gate that needs to do
 more than branch on the exit code:
@@ -257,6 +325,7 @@ $ pdf-redaction-check tagged.pdf --dump-hidden --json
   ],
   "dump": {
     "mode": "hidden",
+    "page_text_read_in_full": true,
     "extracts": [
       {
         "layer": "structure-tree",
@@ -287,6 +356,18 @@ passage from a legitimate second copy of the page.
 `is_text` is false for font-subset extracts, which are characters rather than
 words — see the warning above.
 
+`hidden` says the text is absent from the page text this run could read, which
+is the same comparison the report makes and no stronger. `page_text_read_in_full`
+is what says how much that was: `false` means some of the text the pages draw
+went unread, so text marked hidden may be text the document is still showing. A
+gate that branches on `hidden` should read that field too, in either dump mode
+— `--dump-all` marks each block hidden or not as well, and carries the same
+field. The `--dump-hidden` text output says it in words under its heading,
+where being hidden is what put a block in the output; the text output of
+`--dump-all` marks no block hidden, so it has nothing there to qualify. Every
+recovered block is listed either way — text that survived somewhere is evidence
+whatever the baseline was.
+
 ### Exit codes
 
 | Code | Meaning |
@@ -299,11 +380,27 @@ words — see the warning above.
 
 Suitable for a pre-send hook or CI gate.
 
+`2` says the evidence shows content that was meant to be removed is still
+recoverable, so a check whose evidence rests on something this could not read
+does not reach it. The font-subset check is the one that turns on a comparison
+against the page text: when a page could not be read in full, its findings are
+`WARNING`s, and such a document ends on `1` unless something else convicts it.
+That is not a change to what a code means — it is which code the evidence
+supports.
+
 `3` covers the three ways a run can end without a verdict: the PDF could not be
 read, the `--output` path was unusable, or writing the output failed. `4` is
 reserved for a bad invocation — an unknown option, a missing file argument, an
-unreadable `--secret-file` — so that a typo can never be mistaken for a failed
-redaction.
+unreadable `--secret-file`, or a `--secret` with nothing in it — so that a typo
+can never be mistaken for a failed redaction.
+
+A blank `--secret` is refused rather than searched for, because text with
+nothing in it is in every document ever written: matching it would report every
+document as a failed redaction, and dropping it would check none of them while
+looking like it had. The shape it arrives in is a CI gate running
+`--secret "$NAME"` with the variable unset. Blank lines in a `--secret-file`
+are different, and are skipped: that file holds one secret per line, so a line
+with nothing on it is formatting rather than a request.
 
 ## Limitations
 
@@ -328,15 +425,60 @@ file is clean.
   the same number of bytes wide, leaves codes this cannot turn into characters.
   Those codes are dropped from the page text and reported as a warning rather
   than guessed at, so the visible-text comparison is incomplete for exactly
-  those documents. A `/Differences` array can also name a glyph this does not
-  know — the names it resolves are the standard ones of ISO 32000 Annex D, the
-  four-digit `uniXXXX` and the four- to six-digit `uXXXX` hexadecimal forms,
-  and the Unicode character names, so a producer that
-  invents a name, or takes one from a symbol font, is naming a glyph this cannot
-  identify. That code then keeps whatever the font's base encoding says it
-  draws, which may be a character the page never showed, and nothing is reported.
-  Prefer `--secret` on such files: the raw-object sweep works on bytes and does
-  not depend on the font at all.
+  those documents — and the font-subset finding says so and drops to a
+  `WARNING`, rather than reporting characters this never saw as characters the
+  document no longer draws. A `/Differences` array can also name a glyph this
+  does not know — the names it resolves are the standard ones of ISO 32000
+  Annex D, the four-digit `uniXXXX` and the four- to six-digit `uXXXX`
+  hexadecimal forms, and the Unicode character names, so a producer that
+  invents a name, or takes one from a symbol font, is naming a glyph this
+  cannot identify. That code then keeps whatever the font's base encoding says
+  it draws, which may be a character the page never showed, and nothing is
+  reported. Prefer `--secret` on such files: the raw-object sweep works on
+  bytes and does not depend on the font at all.
+- **A file the PDF reader could only partly read.** qpdf, which reads the file
+  underneath this, does not refuse one it can only partly recover. The common
+  shape is a stream whose compressed data was cut short — a file truncated in
+  transit — which it decompresses as far as the data goes and hands over as
+  though that were the whole stream, leaving a warning on the document rather
+  than raising. The parse of the page then succeeds, so nothing about the page
+  says it stopped short of the end. What it said is collected and reported
+  under `content-stream`, and because that is about the file rather than about
+  any one page it puts the whole page text in question: every font-subset
+  finding in such a run is the weaker of the two. What the lost bytes drew
+  cannot be recovered here, and this tool does not attempt to repair the file.
+  What the reader says about the *structure* of a file — a cross-reference
+  table it had to rebuild by searching the file for its objects — is reported
+  the same way and stops there, because a document put back together that way
+  still hands over every instruction its pages hold. The cost of one of those
+  is any object the search did not find: it is not in the document this
+  inspected, and nothing here can say what was in it. What the reader says is
+  collected up to the end of the page-text pass, so trouble it runs into later
+  — decompressing an attachment for the raw sweep, say — is not reported this
+  way; that stream is reported by the layer that could not read it.
+- **An array of content streams that will not read as one.** A page's drawing
+  instructions can be an array of content streams, and ISO 32000 section 7.8.2
+  makes them one stream, divided only at the boundaries between tokens — so a
+  reader joins them before parsing, and so does this. One entry that will not
+  decode therefore costs the text of every other, because the parse of the
+  joined stream hands over no instructions at all. When that happens the
+  entries are read one at a time instead, carrying the font in effect and the
+  saved graphics states across every join that could be read across, so the
+  readable entries' text is recovered and each entry that would not read is
+  named by its object. Two things cannot be recovered that way, and neither is
+  guessed at. An instruction written across the join beside the entry that
+  failed is split between the two, so its operands or its operator went with
+  that entry. And an entry that would not read may have selected another font,
+  or saved or restored the graphics state, so what it would have left behind is
+  not known and is not carried past it: from there on the text reads as text
+  drawn with no font selected, which shows up among the counts of text this
+  could not turn into characters. ISO 32000 section 9.3.1 gives the font no
+  initial value and wants a `Tf` before any text is shown, so text a reader
+  would draw after that point brings its own font and is still recovered.
+  Neither case draws the wrong characters — an invented character can land on a
+  font mapping that really was orphaned and hide a leak, which is worse than
+  losing the text. A page read this way is not a page read in full, so its
+  fonts get the weaker of the two font-subset findings.
 - **Non-ASCII text in the catch-all string sweep.** Strings that no dedicated
   layer claims are filtered by how much plain ASCII they contain, to keep
   binary values out of the output. Text in scripts that use little ASCII may be
@@ -373,7 +515,43 @@ file is clean.
   page text and does not appear in `--dump-hidden`. Fonts are reached the same
   way, from the pages outwards, so a font named only by an annotation's
   appearance stream or by the form field defaults in `/AcroForm` is not one
-  whose leftovers this inspects.
+  whose leftovers this inspects. A form drawn more than once is read once per
+  distinct drawing, told apart by the form, the font in effect — both the
+  resource name it was selected by and the font that name resolved to — and the
+  content stream that drew it. Two drawings can still differ further out in the
+  chain of resources than those three reach, which takes a document built to do
+  it: a form drawn from two places draws a second form of its own, and the
+  inner drawing looks the same both times — one form, one font in effect, one
+  stream drawing it — while the outer resources that decide what it draws
+  differ. That one is read once, and the second reading's text is missing from
+  the page text.
+- **Structures nested more than 64 levels deep.** Six walks here stop at that
+  depth — the tag tree, the object graph, forms drawn inside forms, the
+  resources reached through them, a font's chain of descendant fonts, and the
+  tree the embedded file names hang off — because a hostile file can nest a
+  structure forever and a walk that followed it would never finish. What is
+  below the limit is not inspected, and every walk that stops says where it
+  gave up, so this shows up as a warning rather than as a clean result. Two of
+  the six only run when a dump mode or a `--secret` asks for them — the object
+  graph and the tree of file names — so a default run says nothing about those
+  two, as the list of warnings above notes. Ordinary documents are nowhere near
+  the limit.
+- **Drawing instructions built to cost more than the file does.** Instructions
+  compress extremely well, so a page of a few kilobytes can hold millions of
+  them, and reading a page has to cost something closer to what the page draws
+  than to what it asks for. The instructions are read one at a time rather than
+  all at once, so how many of them a page holds no longer decides what reading
+  it costs. Two things are bounded on top of that, and each says so when it is
+  reached: at most 64 operands are held waiting for an operator — the ones
+  written last, because those are the ones an operator uses — and at most 64
+  saved graphics states are kept for `q` and `Q` to restore the font from. Both
+  limits are far above anything a producer writes, the longest run of operands
+  on an ordinary page being the dictionary of an inline image, so reaching
+  either is a fact about the file rather than about the document. What none of
+  that bounds is the size of one operand: an array of a million empty strings
+  is a single operand, built whole by the parser before any of this sees it, so
+  a page whose instructions are few and enormous can still exhaust the memory
+  available and end the run with a traceback instead of a report.
 - **Heuristic, not proof.** The font-charset check infers intent from
   structure. Documents with legitimate unused glyphs may produce findings that
   are not leaks.

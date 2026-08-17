@@ -34,9 +34,20 @@ request and on every push to `main`:
 | Job | What it does |
 | --- | ------------ |
 | Tests | The suite on Python 3.11 through 3.14 |
+| Oldest supported pikepdf | The suite against the floor pyproject declares |
 | Coverage gate | `pytest --cov`, failing below `fail_under` in pyproject |
 | Lint | `ruff check`, `ruff format --check`, `pyright`, markdownlint |
 | Build | sdist and wheel, `twine check`, then installs and runs the command |
+
+Every other job installs whatever pikepdf is newest, so nothing but the
+floor job would notice the tool relying on something the declared minimum
+does not have. It reads the floor out of `pyproject.toml` instead of
+repeating it, pins that exact version, and fails if what got installed is
+not what it asked for — a pin that quietly resolved to something newer
+would leave the job passing while testing nothing it claims to. It runs on
+Python 3.11 because the oldest pikepdf has no wheels for the newest
+Pythons, and pip would fall back to a source build that needs qpdf's
+headers.
 
 The commands mirror the ones above, so a green local run is a strong predictor
 — but CI additionally runs the tests on every supported Python version, and its
